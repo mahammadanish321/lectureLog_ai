@@ -1,0 +1,1 @@
+# lectureLog_ai

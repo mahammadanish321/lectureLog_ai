@@ -1,0 +1,9 @@
+deepface
+opencv-python
+requests
+numpy
+python-dotenv
+tf-keras
+fastapi
+uvicorn
+python-multipart

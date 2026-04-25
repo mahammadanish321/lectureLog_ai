@@ -115,7 +115,11 @@ def run_recognition():
     refresh_student_cache()
     
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    # Load a fast face detector for smooth 30FPS tracking
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
     cache_timer = 0
+    objs = [] # Persistent recognition data
     
     while True:
         ret, frame = cap.read()
@@ -123,6 +127,61 @@ def run_recognition():
             time.sleep(0.1)
             continue
         
+        # 1. FAST TRACKING (Every Frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        
+        # Draw boxes for all detected faces
+        for (x, y, w, h) in faces:
+            color = (0, 255, 0) # Neon Green
+            t, l = 2, 20
+            
+            # Sci-Fi Corners (Follows face perfectly at 30FPS)
+            cv2.line(frame, (x, y), (x + l, y), color, t)
+            cv2.line(frame, (x, y), (x, y + l), color, t)
+            cv2.line(frame, (x + w, y), (x + w - l, y), color, t)
+            cv2.line(frame, (x + w, y), (x + w, y + l), color, t)
+            cv2.line(frame, (x, y + h), (x + l, y + h), color, t)
+            cv2.line(frame, (x, y + h), (x, y + h - l), color, t)
+            cv2.line(frame, (x + w, y + h), (x + w - l, y + h), color, t)
+            cv2.line(frame, (x + w, y + h), (x + w, y + h - l), color, t)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+            
+            # Scanning Line
+            scan_pos = int((time.time() * 150) % h)
+            cv2.line(frame, (x, y + scan_pos), (x + w, y + scan_pos), color, 1)
+            cv2.line(frame, (x, y + scan_pos), (x + w, y + scan_pos), (0, 100, 0), 3)
+
+            # Identity Label (Check if we have a match from the background brain)
+            label = "ANALYZING..."
+            if objs and len(objs) > 0:
+                # Find the 'brain' object closest to this 'tracking' box
+                for obj in objs:
+                    ba = obj["facial_area"]
+                    # If the centers are close, it's the same person
+                    if abs((x + w/2) - (ba['x'] + ba['w']/2)) < 50:
+                        current_embedding = obj["embedding"]
+                        best_match_name = None
+                        min_dist = 1.0
+                        
+                        for student in student_cache:
+                            dist = cosine(current_embedding, student['face_embedding'])
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_match_name = student['name']
+                        
+                        if best_match_name and min_dist < 0.4:
+                            label = f"ID: {best_match_name.upper()}"
+                            cv2.putText(frame, "VERIFIED", (x, y - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        else:
+                            cv2.putText(frame, "UNKNOWN", (x, y - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Add general HUD elements
+        cv2.putText(frame, "SYSTEM: ACTIVE", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"TARGETS: {len(faces)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
         # Store frame for streaming
         current_frame = frame.copy()
 

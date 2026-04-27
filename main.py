@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
 import cv2
 import numpy as np
 from deepface import DeepFace
@@ -15,7 +16,38 @@ import shutil
 import json
 
 load_dotenv()
-app = FastAPI()
+
+# Configuration
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5000/api/recognition")
+STUDENTS_API = os.getenv("STUDENTS_API", "http://localhost:5000/api/students")
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+COOLDOWN_PERIOD = int(os.getenv("COOLDOWN_PERIOD", "10"))
+AI_PORT = int(os.getenv("AI_PORT", "8001"))
+
+# Global state
+system_active = True
+student_cache = []
+last_marked = {}
+current_frame = None
+recognition_thread = None
+
+
+def start_recognition_thread():
+    global recognition_thread
+    if recognition_thread and recognition_thread.is_alive():
+        return
+
+    recognition_thread = threading.Thread(target=run_recognition, daemon=True)
+    recognition_thread.start()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    start_recognition_thread()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,18 +55,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configuration
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5000/api/recognition")
-STUDENTS_API = "http://localhost:5000/api/students" 
-CAMERA_INDEX = 0 
-COOLDOWN_PERIOD = 10 
-
-# Global state
-system_active = True
-student_cache = []
-last_marked = {}
-current_frame = None
 
 @app.get("/system/status")
 async def get_status():
@@ -109,12 +129,16 @@ async def video_feed():
 
 def run_recognition():
     global last_marked, student_cache, current_frame
-    print("Starting Recognition Loop (SQL + Stream Mode)...")
+    print(f"Starting Recognition Loop (SQL + Stream Mode) on camera index {CAMERA_INDEX}...")
     
     # Initial cache load
     refresh_student_cache()
     
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"Camera index {CAMERA_INDEX} could not be opened. Check CAMERA_INDEX or /dev/video* access.")
+        return
+
     # Load a fast face detector for smooth 30FPS tracking
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
@@ -124,6 +148,7 @@ def run_recognition():
     while True:
         ret, frame = cap.read()
         if not ret: 
+            print(f"Camera index {CAMERA_INDEX} opened but no frame could be read. Retrying...")
             time.sleep(0.1)
             continue
         
@@ -262,6 +287,4 @@ def run_recognition():
     cap.release()
 
 if __name__ == "__main__":
-    rec_thread = threading.Thread(target=run_recognition, daemon=True)
-    rec_thread.start()
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=AI_PORT)

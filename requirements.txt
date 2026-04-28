@@ -7,3 +7,4 @@ tf-keras
 fastapi
 uvicorn
 python-multipart
+scipy

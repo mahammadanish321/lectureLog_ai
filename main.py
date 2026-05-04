@@ -11,6 +11,9 @@ import time
 from dotenv import load_dotenv
 import threading
 import uvicorn
+import logging
+import signal
+import sys
 from scipy.spatial.distance import cosine
 import shutil
 import json
@@ -85,8 +88,6 @@ def refresh_student_cache():
             current_session_info = None
             system_active = False
             student_cache = []
-            # Stop idle cameras
-            _cleanup_idle_cameras()
             return
 
         # ── Step 3: Fetch students ──
@@ -140,11 +141,21 @@ def refresh_student_cache():
     except Exception as e:
         log("❌", "SYNC", f"Critical refresh error: {e}", "error")
 
-def _cleanup_idle_cameras():
-    """Stop camera workers that are no longer needed."""
+def _cleanup_idle_cameras(exclude=None):
+    """Stop camera workers that are no longer needed.
+    Skips cameras that have an active viewer (streamed within the last 15s)
+    and cameras in the exclude set."""
+    exclude = exclude or set()
+    now = time.time()
     with _state_lock:
         for idx in list(camera_workers.keys()):
+            if idx in exclude:
+                continue
             worker = camera_workers[idx]
+            # Don't kill cameras with an active viewer
+            if (now - worker._last_stream_time) < 15:
+                log("👁️", "CLEANUP", f"Camera {idx} kept alive (active viewer)", "dim")
+                continue
             worker.stop()
             del camera_workers[idx]
             log("📷", "CLEANUP", f"Camera {idx} released (no active sessions)", "dim")
@@ -169,6 +180,7 @@ class CameraWorker:
         self._recognition_lock = threading.Lock()
         self._recognition_busy = False
         self._last_active_time = time.time()
+        self._last_stream_time = time.time()  # Updated by video_feed viewers
 
         threading.Thread(target=self._capture_loop, daemon=True, name=f"cam-{index}-capture").start()
         threading.Thread(target=self._recognition_loop, daemon=True, name=f"cam-{index}-recog").start()
@@ -364,13 +376,11 @@ def run_maintenance():
             for idx in needed:
                 _ensure_camera(idx)
 
-            # Stop cameras no longer needed
-            with _state_lock:
-                for idx in list(camera_workers.keys()):
-                    if idx not in needed:
-                        camera_workers[idx].stop()
-                        del camera_workers[idx]
-                        log("📷", "CLEANUP", f"Camera {idx} stopped (session ended)", "dim")
+            # Stop cameras no longer needed by sessions (but keep browsed ones)
+            _cleanup_idle_cameras(exclude=needed)
+        else:
+            # No active sessions — clean up only cameras with no active viewer
+            _cleanup_idle_cameras()
 
         time.sleep(30)
 
@@ -463,7 +473,12 @@ async def video_feed(v: str = "default", cam: str = None):
     def frame_generator():
         while True:
             worker = camera_workers.get(target_idx)
+            if not worker or not worker.running:
+                # Camera was cleaned up — re-open it since viewer is still active
+                _ensure_camera(target_idx)
+                worker = camera_workers.get(target_idx)
             if worker and worker.running:
+                worker._last_stream_time = time.time()  # Keep-alive for cleanup
                 ret, buffer = cv2.imencode('.jpg', worker.latest_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if ret:
                     yield (b'--frame\r\n'
@@ -503,4 +518,15 @@ async def get_embedding(file: UploadFile = File(...)):
 
 # ── Entry Point ────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=AI_PORT)
+    # Suppress noisy uvicorn/asyncio shutdown tracebacks
+    logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=AI_PORT, log_level="warning")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log("👋", "SYSTEM", "AI Service stopped. Goodbye!", "info")
+        for w in camera_workers.values():
+            w.stop()

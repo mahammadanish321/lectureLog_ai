@@ -1,12 +1,15 @@
+import os
+# Suppress TensorFlow logs before importing
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 import cv2
 import numpy as np
-from deepface import DeepFace
 import requests
-import os
 import time
 from dotenv import load_dotenv
 import threading
@@ -18,6 +21,9 @@ from scipy.spatial.distance import cosine
 import shutil
 import json
 from datetime import datetime
+
+# Lazy loading for DeepFace
+DeepFace = None
 
 load_dotenv()
 
@@ -32,6 +38,7 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 FRAME_SCALE = float(os.getenv("FRAME_SCALE", "0.4"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 CAMERA_IDLE_TIMEOUT = int(os.getenv("CAMERA_IDLE_TIMEOUT", "60"))
+# CAMERA_BACKEND_URL removed - now using direct hardware access
 
 # ── Logging Helpers ────────────────────────────────────────
 def log(icon, tag, msg, level="info"):
@@ -41,11 +48,13 @@ def log(icon, tag, msg, level="info"):
     print(f"{c}[{ts}] {icon} [{tag}] {msg}\033[0m")
 
 # ── Global State ───────────────────────────────────────────
-system_active = False          # Start INACTIVE — no camera access until needed
+system_active = False          # Global system active flag
 student_cache = []
 last_marked = {}               # {student_id: timestamp}
 current_session_info = None    # List of active sessions or None
 camera_workers = {}            # {cam_index: CameraWorker}
+global_error = None            # Track global service errors
+scanner_enabled = True         # Toggle to enable/disable scanning globally
 _state_lock = threading.Lock()
 
 # ── Helper Functions ───────────────────────────────────────
@@ -72,8 +81,10 @@ def refresh_student_cache():
             if sess_resp.status_code == 200:
                 sessions = sess_resp.json()
                 active_sessions = [s for s in sessions if s.get('status') == 'active']
+                global_error = None
         except Exception as e:
             log("❌", "SYNC", f"Cannot reach backend for sessions: {e}", "error")
+            global_error = "Backend service unreachable"
             return
 
         # ── Step 2: Update session info ──
@@ -128,7 +139,7 @@ def refresh_student_cache():
             else:
                 new_cache.extend(all_valid)
 
-        # Deduplicate
+        # ── Step 5: Deduplicate ──
         seen_ids = set()
         student_cache = []
         for s in new_cache:
@@ -136,15 +147,24 @@ def refresh_student_cache():
                 student_cache.append(s)
                 seen_ids.add(s['id'])
 
+        # ── Step 6: Start workers for active sessions ──
+        if active_sessions:
+            for sess in active_sessions:
+                idx = get_camera_index(sess.get('camera_url', '0'))
+                worker = _ensure_camera(idx)
+                if not worker.is_scanning:
+                    worker.is_scanning = True
+                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {idx}", "success")
+
         log("👤", "SYNC", f"Cache updated: {len(student_cache)} students ready for recognition", "success")
 
     except Exception as e:
         log("❌", "SYNC", f"Critical refresh error: {e}", "error")
 
-def _cleanup_idle_cameras(exclude=None):
+def _cleanup_idle_cameras(exclude=None, force=False):
     """Stop camera workers that are no longer needed.
     Skips cameras that have an active viewer (streamed within the last 15s)
-    and cameras in the exclude set."""
+    unless force=True, and cameras in the exclude set."""
     exclude = exclude or set()
     now = time.time()
     with _state_lock:
@@ -152,8 +172,8 @@ def _cleanup_idle_cameras(exclude=None):
             if idx in exclude:
                 continue
             worker = camera_workers[idx]
-            # Don't kill cameras with an active viewer
-            if (now - worker._last_stream_time) < 15:
+            # Don't kill cameras with an active viewer unless forced
+            if not force and (now - worker._last_stream_time) < 15:
                 log("👁️", "CLEANUP", f"Camera {idx} kept alive (active viewer)", "dim")
                 continue
             worker.stop()
@@ -164,7 +184,7 @@ def _ensure_camera(cam_index):
     """Start a camera worker if not already running."""
     with _state_lock:
         if cam_index not in camera_workers:
-            log("📸", "CAMERA", f"Opening camera {cam_index}...", "info")
+            log("📸", "CAMERA", f"Initializing AI Worker for Camera {cam_index}...", "info")
             camera_workers[cam_index] = CameraWorker(cam_index)
         return camera_workers[cam_index]
 
@@ -179,6 +199,10 @@ class CameraWorker:
         self.last_recognition_results = []  # [{name, confidence, area}]
         self._recognition_lock = threading.Lock()
         self._recognition_busy = False
+        self.is_scanning = False    # Controlled by backend
+        self.status = "Initializing Camera..."
+        self.error_message = None
+        # self.stream_url removed - using self.index directly
         self._last_active_time = time.time()
         self._last_stream_time = time.time()  # Updated by video_feed viewers
 
@@ -193,13 +217,18 @@ class CameraWorker:
             log("📷", "CAMERA", f"Camera {self.index} hardware released", "dim")
 
     def _capture_loop(self):
-        log("📸", "CAMERA", f"Capture thread started for Camera {self.index}")
+        log("📷", "CAPTURE", f"Opening Hardware Camera Index: {self.index}")
         self.cap = cv2.VideoCapture(self.index)
 
         if not self.cap.isOpened():
-            log("❌", "CAMERA", f"Cannot open Camera {self.index}! Is it connected?", "error")
+            log("❌", "CAMERA", f"Hardware Camera {self.index} could not be opened! (Is it in use by another app?)", "error")
+            self.status = "Hardware Error"
+            self.error_message = f"Camera {self.index} Hardware Locked"
             self.running = False
             return
+
+        log("✅", "CAPTURE", f"Camera {self.index} Hardware Opened Successfully")
+        self.status = "Camera Online"
 
         # Set lower resolution to reduce memory
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -212,11 +241,15 @@ class CameraWorker:
             ret, frame = self.cap.read()
             if not ret:
                 fail_count += 1
-                if fail_count > 20:
-                    log("❌", "CAMERA", f"Camera {self.index} disconnected after 20 failures", "error")
-                    self.running = False
-                    break
-                time.sleep(0.5)
+                if fail_count % 10 == 0:
+                    log("⚠️", "CAPTURE", f"Stream glitch on Cam {self.index}, retrying... ({fail_count}/50)", "warn")
+                if fail_count > 50:
+                    log("❌", "CAMERA", f"Stream lost for Cam {self.index}. Reconnecting...", "error")
+                    self.cap.release()
+                    time.sleep(2)
+                    self.cap = cv2.VideoCapture(self.stream_url)
+                    fail_count = 0
+                time.sleep(0.1)
                 continue
 
             fail_count = 0
@@ -246,9 +279,18 @@ class CameraWorker:
                 cv2.putText(display, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Status bar
-            status_text = "MONITORING" if system_active else "IDLE (No Session)"
-            status_color = (0, 200, 0) if system_active else (128, 128, 128)
+            status_text = self.status
+            if self.is_scanning:
+                status_text = "AI SCANNING ACTIVE"
+            
+            status_color = (0, 200, 0) if self.is_scanning else (128, 128, 128)
+            if "Error" in self.status or "Failed" in self.status:
+                status_color = (0, 0, 200)
+
             cv2.putText(display, f"CAM {self.index}: {status_text}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            
+            if self.error_message:
+                cv2.putText(display, f"Error: {self.error_message}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
             if system_active and student_cache:
                 cv2.putText(display, f"Students: {len(student_cache)} | Marked: {len(last_marked)}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
@@ -257,10 +299,18 @@ class CameraWorker:
             time.sleep(0.066)  # ~15 FPS display
 
     def _recognition_loop(self):
+        global DeepFace
         log("🧠", "RECOG", f"Recognition thread started for Camera {self.index}")
 
+        # Lazy load DeepFace if not already loaded
+        if DeepFace is None:
+            log("⏳", "AI", "Loading DeepFace & TensorFlow (First run, may take a few seconds)...", "warn")
+            from deepface import DeepFace as DF
+            DeepFace = DF
+            log("✅", "AI", "AI Models loaded and ready.")
+
         while self.running:
-            if not system_active or not student_cache or self._raw_frame is None:
+            if not system_active or not student_cache or self._raw_frame is None or not self.is_scanning:
                 time.sleep(1)
                 continue
 
@@ -269,6 +319,7 @@ class CameraWorker:
                 continue
 
             self._recognition_busy = True
+            log("🔍", f"SCAN-{self.index}", "Analyzing frame for students...", "dim")
             scan_start = time.time()
 
             try:
@@ -350,9 +401,15 @@ class CameraWorker:
 
                 elapsed = time.time() - scan_start
                 log("⏱️", f"CAM-{self.index}", f"Scan complete: {len(objs)} face(s) processed in {elapsed:.1f}s", "dim")
+                
+                # If we reached here, recognition is working
+                self.status = "AI Scanning Active"
+                self.error_message = None
 
             except Exception as e:
                 log("❌", f"CAM-{self.index}", f"Recognition error: {e}", "error")
+                self.status = "Recognition Failed"
+                self.error_message = str(e)
             finally:
                 self._recognition_busy = False
 
@@ -379,17 +436,35 @@ def run_maintenance():
             # Stop cameras no longer needed by sessions (but keep browsed ones)
             _cleanup_idle_cameras(exclude=needed)
         else:
-            # No active sessions — clean up only cameras with no active viewer
-            _cleanup_idle_cameras()
+            # No active sessions — clean up everything immediately
+            _cleanup_idle_cameras(force=True)
 
         time.sleep(30)
 
 # ── FastAPI ────────────────────────────────────────────────
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
+    global DeepFace
     log("🚀", "SYSTEM", "LectureLog AI Service starting...")
     log("📋", "SYSTEM", f"Config: threshold={CONFIDENCE_THRESHOLD}, cooldown={COOLDOWN_PERIOD}s, scale={FRAME_SCALE}, interval={RECOGNITION_INTERVAL}s")
-    threading.Thread(target=run_maintenance, daemon=True, name="maintenance").start()
+    
+    # Start a background thread to warm up DeepFace so it doesn't lag the first scan
+    def warmup():
+        global DeepFace
+        try:
+            log("🔥", "AI", "Warming up AI models in background...", "dim")
+            from deepface import DeepFace as DF
+            DeepFace = DF
+            # Pre-load VGG-Face by doing a dummy representation
+            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+            DeepFace.represent(dummy, model_name="VGG-Face", enforce_detection=False)
+            log("✨", "AI", "Background warmup complete. Scanning will be fast.", "success")
+        except Exception as e:
+            log("⚠️", "AI", f"Warmup failed: {e}", "warn")
+
+    threading.Thread(target=warmup, daemon=True).start()
+
+    threading.Thread(target=run_maintenance, daemon=True, name="Maintenance").start()
     yield
     log("🛑", "SYSTEM", "AI Service shutting down...")
     for w in camera_workers.values():
@@ -402,8 +477,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/system/status")
 async def get_status():
+    cam_status = {}
+    for idx, worker in camera_workers.items():
+        cam_status[idx] = {
+            "status": worker.status,
+            "error": worker.error_message,
+            "is_scanning": worker.is_scanning,
+            "busy": worker._recognition_busy
+        }
+
     return {
         "active": system_active,
+        "scanner_enabled": scanner_enabled,
+        "global_error": global_error,
+        "cameras": cam_status,
         "cameras_open": list(camera_workers.keys()),
         "students_cached": len(student_cache),
         "students_marked": len(last_marked),
@@ -420,9 +507,33 @@ async def toggle_system():
     return {"active": system_active}
 
 @app.post("/system/refresh")
-async def refresh_system():
+async def refresh_system(scan: bool = True):
+    """
+    Called by backend when a session starts.
+    - scan=True: Automatically start scanning on all active cameras.
+    """
     refresh_student_cache()
-    return {"message": "AI Cache Refreshed"}
+    if system_active and current_session_info:
+        for sess in current_session_info:
+            idx = get_camera_index(sess.get('camera_url', '0'))
+            worker = _ensure_camera(idx)
+            if scan:
+                worker.is_scanning = True
+                log("🔍", "SYSTEM", f"Scanning started for Camera {idx}", "success")
+    return {"message": "AI Cache Refreshed", "system_active": system_active}
+
+@app.post("/scanner/start")
+async def start_scanner(cam: int = 0):
+    worker = _ensure_camera(cam)
+    worker.is_scanning = True
+    return {"status": "Scanning started", "camera": cam}
+
+@app.post("/scanner/stop")
+async def stop_scanner(cam: int = 0):
+    if cam in camera_workers:
+        camera_workers[cam].is_scanning = False
+        return {"status": "Scanning stopped", "camera": cam}
+    return {"error": "Camera not open"}
 
 @app.get("/cameras")
 async def list_cameras():

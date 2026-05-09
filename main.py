@@ -30,9 +30,11 @@ load_dotenv()
 # ── Configuration ──────────────────────────────────────────
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5000/api/recognition")
 STUDENTS_API = os.getenv("STUDENTS_API", "http://localhost:5000/api/students")
+SESSIONS_API = os.getenv("SESSIONS_API", "http://localhost:5000/api/sessions")
 CLASSROOMS_API = os.getenv("CLASSROOMS_API", "http://localhost:5000/api/classrooms")
 COOLDOWN_PERIOD = int(os.getenv("COOLDOWN_PERIOD", "30"))
 AI_PORT = int(os.getenv("AI_PORT", "8001"))
+STREAM_BACKEND_URL = os.getenv("STREAM_BACKEND_URL", "http://localhost:8002/video_feed")
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "3.0"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 FRAME_SCALE = float(os.getenv("FRAME_SCALE", "0.4"))
@@ -58,14 +60,20 @@ scanner_enabled = True         # Toggle to enable/disable scanning globally
 _state_lock = threading.Lock()
 
 # ── Helper Functions ───────────────────────────────────────
-def get_camera_index(cam_info):
-    """Convert a camera_url string to an integer index."""
+def get_camera_url(cam_info):
+    """Convert a camera_url string or index to a full stream URL."""
     cam_info = str(cam_info).strip()
+    
+    # If it's already a full URL, use it
+    if cam_info.startswith("http://") or cam_info.startswith("https://") or cam_info.startswith("rtsp://"):
+        return cam_info
+        
+    # If it's a digit (hardware index), point it to our camera_backend
     if cam_info.isdigit():
-        return int(cam_info)
-    if "Smart Connect" in cam_info or "Phone" in cam_info:
-        return 1
-    return 0
+        return f"{STREAM_BACKEND_URL}/{cam_info}"
+        
+    # Default to camera 0 on our backend
+    return f"{STREAM_BACKEND_URL}/0"
 
 def refresh_student_cache():
     """Fetch active sessions and matching students from backend."""
@@ -77,7 +85,7 @@ def refresh_student_cache():
         # ── Step 1: Fetch active sessions ──
         active_sessions = []
         try:
-            sess_resp = requests.get("http://localhost:5000/api/sessions", timeout=5)
+            sess_resp = requests.get(SESSIONS_API, timeout=5)
             if sess_resp.status_code == 200:
                 sessions = sess_resp.json()
                 active_sessions = [s for s in sessions if s.get('status') == 'active']
@@ -150,11 +158,11 @@ def refresh_student_cache():
         # ── Step 6: Start workers for active sessions ──
         if active_sessions:
             for sess in active_sessions:
-                idx = get_camera_index(sess.get('camera_url', '0'))
-                worker = _ensure_camera(idx)
+                url = get_camera_url(sess.get('camera_url', '0'))
+                worker = _ensure_camera(url)
                 if not worker.is_scanning:
                     worker.is_scanning = True
-                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {idx}", "success")
+                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url}", "success")
 
         log("👤", "SYNC", f"Cache updated: {len(student_cache)} students ready for recognition", "success")
 
@@ -180,13 +188,13 @@ def _cleanup_idle_cameras(exclude=None, force=False):
             del camera_workers[idx]
             log("📷", "CLEANUP", f"Camera {idx} released (no active sessions)", "dim")
 
-def _ensure_camera(cam_index):
+def _ensure_camera(cam_url):
     """Start a camera worker if not already running."""
     with _state_lock:
-        if cam_index not in camera_workers:
-            log("📸", "CAMERA", f"Initializing AI Worker for Camera {cam_index}...", "info")
-            camera_workers[cam_index] = CameraWorker(cam_index)
-        return camera_workers[cam_index]
+        if cam_url not in camera_workers:
+            log("📸", "CAMERA", f"Initializing AI Worker for Stream: {cam_url}...", "info")
+            camera_workers[cam_url] = CameraWorker(cam_url)
+        return camera_workers[cam_url]
 
 # ── Camera Worker (Optimized) ──────────────────────────────
 class CameraWorker:
@@ -217,7 +225,7 @@ class CameraWorker:
             log("📷", "CAMERA", f"Camera {self.index} hardware released", "dim")
 
     def _capture_loop(self):
-        log("📷", "CAPTURE", f"Opening Hardware Camera Index: {self.index}")
+        log("📷", "CAPTURE", f"Connecting to Video Stream: {self.index}")
         self.cap = cv2.VideoCapture(self.index)
 
         if not self.cap.isOpened():
@@ -247,7 +255,7 @@ class CameraWorker:
                     log("❌", "CAMERA", f"Stream lost for Cam {self.index}. Reconnecting...", "error")
                     self.cap.release()
                     time.sleep(2)
-                    self.cap = cv2.VideoCapture(self.stream_url)
+                    self.cap = cv2.VideoCapture(self.index)
                     fail_count = 0
                 time.sleep(0.1)
                 continue
@@ -427,11 +435,11 @@ def run_maintenance():
         if system_active and current_session_info:
             needed = set()
             for s in current_session_info:
-                idx = get_camera_index(s.get('camera_url', '0'))
-                needed.add(idx)
+                url = get_camera_url(s.get('camera_url', '0'))
+                needed.add(url)
 
-            for idx in needed:
-                _ensure_camera(idx)
+            for url in needed:
+                _ensure_camera(url)
 
             # Stop cameras no longer needed by sessions (but keep browsed ones)
             _cleanup_idle_cameras(exclude=needed)
@@ -515,11 +523,11 @@ async def refresh_system(scan: bool = True):
     refresh_student_cache()
     if system_active and current_session_info:
         for sess in current_session_info:
-            idx = get_camera_index(sess.get('camera_url', '0'))
-            worker = _ensure_camera(idx)
+            url = get_camera_url(sess.get('camera_url', '0'))
+            worker = _ensure_camera(url)
             if scan:
                 worker.is_scanning = True
-                log("🔍", "SYSTEM", f"Scanning started for Camera {idx}", "success")
+                log("🔍", "SYSTEM", f"Scanning started for Stream {url}", "success")
     return {"message": "AI Cache Refreshed", "system_active": system_active}
 
 @app.post("/scanner/start")
@@ -544,12 +552,12 @@ async def list_cameras():
             classrooms = resp.json()
             cameras = []
             for c in classrooms:
-                cam_url = c.get('camera_url', '0')
+                cam_url_val = c.get('camera_url', '0')
                 cameras.append({
                     "classroom_id": c['id'],
                     "classroom_name": c['name'],
-                    "camera_index": get_camera_index(cam_url),
-                    "camera_url": cam_url
+                    "camera_index": cam_url_val,
+                    "camera_url": get_camera_url(cam_url_val)
                 })
             return cameras
         return []
@@ -564,30 +572,27 @@ async def video_feed(v: str = "default", cam: str = None):
     - ?cam=<index>     → Show a specific camera by index (idle browsing mode)
     - default          → Show first available camera
     """
-    target_idx = 0
+    target_url = get_camera_url("0")
 
     if cam is not None:
         # Direct camera index mode (idle browsing)
-        try:
-            target_idx = int(cam)
-        except:
-            target_idx = 0
+        target_url = get_camera_url(cam)
     elif v != "default" and current_session_info:
         # Session-based camera selection
         target_sess = next((s for s in current_session_info if str(s.get('id')) == v), None)
         if target_sess:
-            target_idx = get_camera_index(target_sess.get('camera_url', '0'))
+            target_url = get_camera_url(target_sess.get('camera_url', '0'))
 
     # Ensure camera is open
-    _ensure_camera(target_idx)
+    _ensure_camera(target_url)
 
     def frame_generator():
         while True:
-            worker = camera_workers.get(target_idx)
+            worker = camera_workers.get(target_url)
             if not worker or not worker.running:
                 # Camera was cleaned up — re-open it since viewer is still active
-                _ensure_camera(target_idx)
-                worker = camera_workers.get(target_idx)
+                _ensure_camera(target_url)
+                worker = camera_workers.get(target_url)
             if worker and worker.running:
                 worker._last_stream_time = time.time()  # Keep-alive for cleanup
                 ret, buffer = cv2.imencode('.jpg', worker.latest_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -597,7 +602,8 @@ async def video_feed(v: str = "default", cam: str = None):
             else:
                 # Send a blank frame with error message
                 blank = np.zeros((360, 480, 3), dtype=np.uint8)
-                cv2.putText(blank, f"Camera {target_idx} unavailable", (60, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+                cv2.putText(blank, f"Stream unavailable", (60, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+                cv2.putText(blank, f"{target_url}", (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
                 ret, buffer = cv2.imencode('.jpg', blank)
                 if ret:
                     yield (b'--frame\r\n'

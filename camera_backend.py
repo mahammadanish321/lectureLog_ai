@@ -1,7 +1,8 @@
 import cv2
 import time
 import threading
-from fastapi import FastAPI, Response
+import subprocess
+from fastapi import FastAPI, Response, Query
 from fastapi.responses import StreamingResponse
 import uvicorn
 import sys
@@ -12,6 +13,40 @@ app = FastAPI()
 # { cam_index: { "cap": VideoCapture, "lock": Lock, "last_frame": frame } }
 cameras = {}
 _cameras_lock = threading.Lock()
+
+def find_camera_index_by_label(target_label):
+    """
+    Tries to find the hardware index by poking devices directly.
+    """
+    if not target_label:
+        return None
+        
+    print(f"[Camera-Backend] 🔍 Searching hardware for label: {target_label}")
+    
+    # We'll try a few common indices and see which one matches the label
+    # or just fallback to the label matching if hardware probing is too slow.
+    # For now, let's stick to the list but fix the order by using a more reliable command.
+    try:
+        # This command is more specific to video devices
+        cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
+            
+            # Filter out duplicates and non-camera devices if possible
+            unique_names = []
+            for name in lines:
+                if name not in unique_names: unique_names.append(name)
+            
+            for idx, name in enumerate(unique_names):
+                if target_label.lower() in name.lower() or name.lower() in target_label.lower():
+                    print(f"[Camera-Backend] 🎯 Matched label '{target_label}' to hardware index {idx}")
+                    return idx
+    except Exception as e:
+        print(f"[Camera-Backend] ⚠️ Label lookup failed: {e}")
+    
+    return None
 
 def get_camera(idx):
     with _cameras_lock:
@@ -54,7 +89,6 @@ def capture_loop(idx):
         time.sleep(0.03) # ~30 FPS
 
 def generate_frames(idx):
-    boundary = "frame"
     while True:
         cam = get_camera(idx)
         if not cam or not cam["running"]:
@@ -71,24 +105,54 @@ def generate_frames(idx):
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
         
-        time.sleep(0.03) # Match ~30 FPS capture rate
+        time.sleep(0.03)
         
-        # If camera died, try to recover it after a delay
+        # Recovery logic
         if cam and not cam["running"]:
             print(f"[Camera-Backend] 🔄 Attempting to recover Camera {idx}...")
             with _cameras_lock:
-                del cameras[idx]
+                if idx in cameras: del cameras[idx]
             time.sleep(2)
 
 @app.get("/video_feed/{idx}")
-async def video_feed(idx: int):
-    print(f"[Camera-Backend] 📡 New stream request for Camera {idx}")
-    return StreamingResponse(generate_frames(idx), media_type="multipart/x-mixed-replace; boundary=frame")
+async def video_feed(idx: int, label: str = Query(None)):
+    """
+    Stream video from a hardware index.
+    If 'label' is provided, it tries to find the current index for that label first.
+    """
+    actual_idx = idx
+    
+    # We now trust the DB index (idx) by default. 
+    # Label matching is now a DISCOVERY tool, not a mandatory override.
+    if label:
+        print(f"[Camera-Backend] 💡 DB suggests Index {idx} for '{label}'")
+        # We only override if the requested index is -1 or similar
+        if idx < 0:
+            matched_idx = find_camera_index_by_label(label)
+            if matched_idx is not None:
+                actual_idx = matched_idx
+            
+    print(f"[Camera-Backend] 📡 New stream request for Camera {actual_idx} (Requested: {idx}, Label: {label})")
+    return StreamingResponse(generate_frames(actual_idx), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/health")
 async def health():
-    print(f"[Camera-Backend] 💓 Health check received")
     return {"status": "Camera Backend Online", "cameras_open": list(cameras.keys())}
+
+@app.get("/list_cameras")
+async def list_cameras():
+    try:
+        cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
+            unique_names = []
+            for name in lines:
+                if name not in unique_names: unique_names.append(name)
+            return {"cameras": unique_names}
+    except Exception as e:
+        return {"error": str(e)}
+    return {"cameras": []}
 
 def cleanup_idle_cameras():
     """Background task to release cameras that haven't been accessed for 30s."""
@@ -111,8 +175,6 @@ def cleanup_idle_cameras():
                 del cameras[idx]
 
 if __name__ == "__main__":
-    # Start cleanup thread
     threading.Thread(target=cleanup_idle_cameras, daemon=True).start()
-    
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8002
     uvicorn.run(app, host="0.0.0.0", port=port)

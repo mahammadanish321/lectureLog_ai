@@ -60,8 +60,8 @@ scanner_enabled = True         # Toggle to enable/disable scanning globally
 _state_lock = threading.Lock()
 
 # ── Helper Functions ───────────────────────────────────────
-def get_camera_url(cam_info):
-    """Convert a camera_url string or index to a full stream URL."""
+def get_camera_url(cam_info, label=None):
+    """Convert a camera_url string or index to a full stream URL with optional label mapping."""
     cam_info = str(cam_info).strip()
     
     # If it's already a full URL, use it
@@ -70,10 +70,18 @@ def get_camera_url(cam_info):
         
     # If it's a digit (hardware index), point it to our camera_backend
     if cam_info.isdigit():
-        return f"{STREAM_BACKEND_URL}/{cam_info}"
+        url = f"{STREAM_BACKEND_URL}/{cam_info}"
+        if label:
+            import urllib.parse
+            url += f"?label={urllib.parse.quote(label)}"
+        return url
         
     # Default to camera 0 on our backend
-    return f"{STREAM_BACKEND_URL}/0"
+    url = f"{STREAM_BACKEND_URL}/0"
+    if label:
+        import urllib.parse
+        url += f"?label={urllib.parse.quote(label)}"
+    return url
 
 def refresh_student_cache():
     """Fetch active sessions and matching students from backend."""
@@ -158,7 +166,7 @@ def refresh_student_cache():
         # ── Step 6: Start workers for active sessions ──
         if active_sessions:
             for sess in active_sessions:
-                url = get_camera_url(sess.get('camera_url', '0'))
+                url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
                 worker = _ensure_camera(url)
                 if not worker.is_scanning:
                     worker.is_scanning = True
@@ -261,7 +269,10 @@ class CameraWorker:
                 continue
 
             fail_count = 0
-            self._raw_frame = frame  # Store raw for recognition
+            if frame is not None:
+                self._raw_frame = frame  # Store raw for recognition
+            else:
+                continue
 
             # Build display frame with overlays
             display = frame.copy()
@@ -377,7 +388,7 @@ class CameraWorker:
 
                     confidence = 1.0 - min_dist
 
-                    if best_match and min_dist < CONFIDENCE_THRESHOLD:
+                    if best_match and min_dist < (CONFIDENCE_THRESHOLD + 0.05): # Slightly more lenient
                         student_id = best_match['id']
                         student_name = best_match['name']
                         current_time = time.time()
@@ -398,10 +409,10 @@ class CameraWorker:
                                 log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name}", "success")
                             except Exception as e:
                                 log("❌", f"CAM-{self.index}", f"  → Failed to mark attendance: {e}", "error")
-                    elif best_match and min_dist < 0.65:
+                    elif best_match and min_dist < 0.75: # Increased range for 'Analyzing' feedback
                         # Low confidence — face detected but not sure
                         results.append({'name': "ANALYZING", 'confidence': confidence, 'area': area})
-                        log("🔍", f"CAM-{self.index}", f"Low confidence face: closest to {best_match['name']} ({confidence:.1%}) — below threshold", "warn")
+                        log("🔍", f"CAM-{self.index}", f"Low confidence face: closest to {best_match['name']} ({confidence:.1%}) — trying to confirm...", "warn")
                     else:
                         results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
 
@@ -435,7 +446,7 @@ def run_maintenance():
         if system_active and current_session_info:
             needed = set()
             for s in current_session_info:
-                url = get_camera_url(s.get('camera_url', '0'))
+                url = get_camera_url(s.get('camera_url', '0'), s.get('camera_name'))
                 needed.add(url)
 
             for url in needed:
@@ -523,7 +534,7 @@ async def refresh_system(scan: bool = True):
     refresh_student_cache()
     if system_active and current_session_info:
         for sess in current_session_info:
-            url = get_camera_url(sess.get('camera_url', '0'))
+            url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
             worker = _ensure_camera(url)
             if scan:
                 worker.is_scanning = True
@@ -581,7 +592,7 @@ async def video_feed(v: str = "default", cam: str = None):
         # Session-based camera selection
         target_sess = next((s for s in current_session_info if str(s.get('id')) == v), None)
         if target_sess:
-            target_url = get_camera_url(target_sess.get('camera_url', '0'))
+            target_url = get_camera_url(target_sess.get('camera_url', '0'), target_sess.get('camera_name'))
 
     # Ensure camera is open
     _ensure_camera(target_url)
@@ -615,23 +626,42 @@ async def video_feed(v: str = "default", cam: str = None):
 @app.post("/embed")
 async def get_embedding(file: UploadFile = File(...)):
     """Generate a face embedding from an uploaded image."""
-    temp_path = f"temp_{int(time.time())}.jpg"
+    temp_path = os.path.join(os.getcwd(), f"temp_{int(time.time())}_{file.filename}")
+    log("📁", "EMBED", f"Processing embedding request for: {file.filename}")
+    
     try:
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Securely write the file
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        log("🔍", "EMBED", f"File saved to {temp_path}, starting DeepFace analysis...")
+        
         try:
-            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=True)
-        except:
-            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=False)
+            # Try with detection first
+            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=True, detector_backend="opencv")
+        except Exception as detection_err:
+            log("⚠️", "EMBED", f"Face detection failed: {detection_err}. Retrying without enforcement...", "warn")
+            # Fallback: retry without enforcement
+            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=False, detector_backend="opencv")
+            
+        # Clean up immediately
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        if objs:
+            
+        if objs and len(objs) > 0:
+            log("✅", "EMBED", "Embedding generated successfully", "success")
             return {"embedding": objs[0]["embedding"]}
-        return {"error": "Could not find a valid face signature."}
+        
+        log("❌", "EMBED", "No face detected in the image", "error")
+        return {"error": "Could not find a valid face signature. Ensure the photo is clear and contains a face."}
+        
     except Exception as e:
+        log("❌", "EMBED", f"Critical embedding error: {str(e)}", "error")
         if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return {"error": str(e)}
+            try: os.remove(temp_path)
+            except: pass
+        return {"error": f"AI Engine Error: {str(e)}"}
 
 # ── Entry Point ────────────────────────────────────────────
 if __name__ == "__main__":

@@ -154,16 +154,33 @@ async def list_cameras():
         return {"error": str(e)}
     return {"cameras": []}
 
+@app.post("/release/{idx}")
+async def release_camera(idx: int):
+    """Explicitly release a hardware camera."""
+    with _cameras_lock:
+        if idx in cameras:
+            cam = cameras[idx]
+            print(f"[Camera-Backend] 🛑 Explicit release requested for Camera {idx}...")
+            cam["running"] = False
+            # Wait a moment for threads to notice running=False
+            time.sleep(0.1)
+            with cam["lock"]:
+                if cam["cap"]:
+                    cam["cap"].release()
+            del cameras[idx]
+            return {"status": f"Camera {idx} released"}
+    return {"status": "Camera not active"}
+
 def cleanup_idle_cameras():
-    """Background task to release cameras that haven't been accessed for 30s."""
+    """Background task to release cameras that haven't been accessed for 5s."""
     while True:
-        time.sleep(10)
+        time.sleep(2)
         now = time.time()
         to_delete = []
         
         with _cameras_lock:
             for idx, cam in cameras.items():
-                if now - cam["last_access"] > 30:
+                if now - cam["last_access"] > 5:
                     print(f"[Camera-Backend] 💤 Camera {idx} is idle. Releasing hardware...")
                     cam["running"] = False
                     with cam["lock"]:

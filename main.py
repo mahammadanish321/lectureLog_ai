@@ -60,28 +60,47 @@ scanner_enabled = True         # Toggle to enable/disable scanning globally
 _state_lock = threading.Lock()
 
 # ── Helper Functions ───────────────────────────────────────
+def find_camera_index_by_label(target_label):
+    """Tries to find the hardware index by poking devices directly using PowerShell."""
+    if not target_label: return None
+    log("🔍", "CAMERA", f"Searching hardware for label: {target_label}")
+    try:
+        import subprocess
+        cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
+            unique_names = []
+            for name in lines:
+                if name not in unique_names: unique_names.append(name)
+            for idx, name in enumerate(unique_names):
+                if target_label.lower() in name.lower() or name.lower() in target_label.lower():
+                    log("🎯", "CAMERA", f"Matched label '{target_label}' to hardware index {idx}")
+                    return idx
+    except Exception as e:
+        log("⚠️", "CAMERA", f"Label lookup failed: {e}", "warn")
+    return None
+
 def get_camera_url(cam_info, label=None):
-    """Convert a camera_url string or index to a full stream URL with optional label mapping."""
+    """Convert a camera_url string or index to a full stream URL or hardware index."""
     cam_info = str(cam_info).strip()
     
     # If it's already a full URL, use it
     if cam_info.startswith("http://") or cam_info.startswith("https://") or cam_info.startswith("rtsp://"):
         return cam_info
         
-    # If it's a digit (hardware index), point it to our camera_backend
+    # If a label is provided, try to find the hardware index by label first for accuracy
+    if label and len(str(label)) > 3:
+        matched_idx = find_camera_index_by_label(label)
+        if matched_idx is not None:
+            return matched_idx
+
+    # Fallback to the digit index from DB
     if cam_info.isdigit():
-        url = f"{STREAM_BACKEND_URL}/{cam_info}"
-        if label:
-            import urllib.parse
-            url += f"?label={urllib.parse.quote(label)}"
-        return url
+        return int(cam_info)
         
-    # Default to camera 0 on our backend
-    url = f"{STREAM_BACKEND_URL}/0"
-    if label:
-        import urllib.parse
-        url += f"?label={urllib.parse.quote(label)}"
-    return url
+    # Default to camera 0
+    return 0
 
 def refresh_student_cache():
     """Fetch active sessions and matching students from backend."""
@@ -111,7 +130,8 @@ def refresh_student_cache():
             current_session_info = active_sessions
             system_active = True
         else:
-            log("💤", "SYNC", "No active sessions. System is idle.", "dim")
+            if system_active:
+                log("💤", "SYNC", "No active sessions. System transitioning to idle.", "dim")
             current_session_info = None
             system_active = False
             student_cache = []
@@ -125,6 +145,8 @@ def refresh_student_cache():
                 return
         except Exception as e:
             log("❌", "SYNC", f"Cannot reach students API: {e}", "error")
+            # If we can't reach the backend, we should probably stop scanning for safety
+            system_active = False
             return
 
         all_students = response.json()
@@ -192,6 +214,19 @@ def _cleanup_idle_cameras(exclude=None, force=False):
             if not force and (now - worker._last_stream_time) < 15:
                 log("👁️", "CLEANUP", f"Camera {idx} kept alive (active viewer)", "dim")
                 continue
+            
+            # Derivative: If it's a backend URL, tell the backend to release it too
+            try:
+                if str(idx).startswith(STREAM_BACKEND_URL):
+                    # Derive index from URL: .../video_feed/0 -> 0
+                    parts = str(idx).split('/')
+                    cam_id = parts[-1].split('?')[0]
+                    if cam_id.isdigit():
+                        release_url = f"{STREAM_BACKEND_URL.replace('/video_feed', '')}/release/{cam_id}"
+                        log("🛑", "CLEANUP", f"Signaling Camera Backend to release {cam_id}...")
+                        requests.post(release_url, timeout=1)
+            except: pass
+
             worker.stop()
             del camera_workers[idx]
             log("📷", "CLEANUP", f"Camera {idx} released (no active sessions)", "dim")
@@ -233,17 +268,25 @@ class CameraWorker:
             log("📷", "CAMERA", f"Camera {self.index} hardware released", "dim")
 
     def _capture_loop(self):
-        log("📷", "CAPTURE", f"Connecting to Video Stream: {self.index}")
+        log("📷", "CAPTURE", f"Connecting to Video Source: {self.index}")
+        
+        # Open the capture object
         self.cap = cv2.VideoCapture(self.index)
 
         if not self.cap.isOpened():
-            log("❌", "CAMERA", f"Hardware Camera {self.index} could not be opened! (Is it in use by another app?)", "error")
-            self.status = "Hardware Error"
-            self.error_message = f"Camera {self.index} Hardware Locked"
-            self.running = False
-            return
+            # If it's a string index that is actually a digit, try converting to int
+            if isinstance(self.index, str) and self.index.isdigit():
+                log("⚠️", "CAMERA", f"Retrying as integer index: {self.index}")
+                self.cap = cv2.VideoCapture(int(self.index))
+            
+            if not self.cap.isOpened():
+                log("❌", "CAMERA", f"Video source {self.index} could not be opened! (Is it in use?)", "error")
+                self.status = "Hardware Error"
+                self.error_message = f"Source {self.index} Locked"
+                self.running = False
+                return
 
-        log("✅", "CAPTURE", f"Camera {self.index} Hardware Opened Successfully")
+        log("✅", "CAPTURE", f"Video source {self.index} Opened Successfully")
         self.status = "Camera Online"
 
         # Set lower resolution to reduce memory
@@ -458,7 +501,7 @@ def run_maintenance():
             # No active sessions — clean up everything immediately
             _cleanup_idle_cameras(force=True)
 
-        time.sleep(30)
+        time.sleep(10)
 
 # ── FastAPI ────────────────────────────────────────────────
 @asynccontextmanager
@@ -528,17 +571,28 @@ async def toggle_system():
 @app.post("/system/refresh")
 async def refresh_system(scan: bool = True):
     """
-    Called by backend when a session starts.
+    Called by backend when a session starts OR ends.
     - scan=True: Automatically start scanning on all active cameras.
     """
     refresh_student_cache()
+    
     if system_active and current_session_info:
+        needed = set()
         for sess in current_session_info:
             url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
+            needed.add(url)
             worker = _ensure_camera(url)
             if scan:
                 worker.is_scanning = True
                 log("🔍", "SYSTEM", f"Scanning started for Stream {url}", "success")
+        
+        # Stop any cameras that were running but are no longer in the active sessions
+        _cleanup_idle_cameras(exclude=needed)
+    else:
+        # System became idle — force stop everything immediately
+        log("💤", "SYSTEM", "No active sessions after refresh. Cleaning up cameras.", "info")
+        _cleanup_idle_cameras(force=True)
+
     return {"message": "AI Cache Refreshed", "system_active": system_active}
 
 @app.post("/scanner/start")
@@ -583,16 +637,37 @@ async def video_feed(v: str = "default", cam: str = None):
     - ?cam=<index>     → Show a specific camera by index (idle browsing mode)
     - default          → Show first available camera
     """
-    target_url = get_camera_url("0")
+    target_url = None
 
     if cam is not None:
         # Direct camera index mode (idle browsing)
         target_url = get_camera_url(cam)
-    elif v != "default" and current_session_info:
+    elif v and v != "default":
         # Session-based camera selection
-        target_sess = next((s for s in current_session_info if str(s.get('id')) == v), None)
+        target_sess = None
+        if current_session_info:
+            target_sess = next((s for s in current_session_info if str(s.get('id')) == v), None)
+        
         if target_sess:
             target_url = get_camera_url(target_sess.get('camera_url', '0'), target_sess.get('camera_name'))
+        else:
+            # Session provided but not found/active — DO NOT fallback to camera 0
+            async def error_gen():
+                blank = np.zeros((360, 480, 3), dtype=np.uint8)
+                cv2.putText(blank, "Session Ended", (120, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+                cv2.putText(blank, f"ID: {v}", (180, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+                _, buffer = cv2.imencode('.jpg', blank)
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            return StreamingResponse(error_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+    
+    if not target_url:
+         # No target (Idle state) — send an idle placeholder instead of opening hardware
+         async def idle_gen():
+            blank = np.zeros((360, 480, 3), dtype=np.uint8)
+            cv2.putText(blank, "System Idle", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+            _, buffer = cv2.imencode('.jpg', blank)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+         return StreamingResponse(idle_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
     # Ensure camera is open
     _ensure_camera(target_url)

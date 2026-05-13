@@ -21,6 +21,7 @@ from scipy.spatial.distance import cosine
 import shutil
 import json
 from datetime import datetime
+import sys
 
 # Lazy loading for DeepFace
 DeepFace = None
@@ -35,6 +36,7 @@ CLASSROOMS_API = os.getenv("CLASSROOMS_API", "http://localhost:5000/api/classroo
 COOLDOWN_PERIOD = int(os.getenv("COOLDOWN_PERIOD", "30"))
 AI_PORT = int(os.getenv("AI_PORT", "8001"))
 STREAM_BACKEND_URL = os.getenv("STREAM_BACKEND_URL", "http://localhost:8002/video_feed")
+ORGANIZATION_ID = os.getenv("ORGANIZATION_ID") # Used for multi-tenancy isolation
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "3.0"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 FRAME_SCALE = float(os.getenv("FRAME_SCALE", "0.4"))
@@ -48,6 +50,11 @@ def log(icon, tag, msg, level="info"):
     colors = {"info": "\033[0m", "success": "\033[92m", "warn": "\033[93m", "error": "\033[91m", "dim": "\033[90m"}
     c = colors.get(level, "\033[0m")
     print(f"{c}[{ts}] {icon} [{tag}] {msg}\033[0m")
+
+log("🖥️", "SYSTEM", f"Python Executable: {sys.executable}")
+log("🆔", "SYSTEM", f"Python Version: {sys.version}")
+log("📂", "SYSTEM", f"Working Directory: {os.getcwd()}")
+log("⚙️", "SYSTEM", f"Platform: {sys.platform}")
 
 # ── Global State ───────────────────────────────────────────
 system_active = False          # Global system active flag
@@ -112,7 +119,8 @@ def refresh_student_cache():
         # ── Step 1: Fetch active sessions ──
         active_sessions = []
         try:
-            sess_resp = requests.get(SESSIONS_API, timeout=5)
+            params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
+            sess_resp = requests.get(SESSIONS_API, params=params, timeout=5)
             if sess_resp.status_code == 200:
                 sessions = sess_resp.json()
                 active_sessions = [s for s in sessions if s.get('status') == 'active']
@@ -139,7 +147,8 @@ def refresh_student_cache():
 
         # ── Step 3: Fetch students ──
         try:
-            response = requests.get(STUDENTS_API, timeout=5)
+            params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
+            response = requests.get(STUDENTS_API, params=params, timeout=5)
             if response.status_code != 200:
                 log("❌", "SYNC", f"Students API returned {response.status_code}", "error")
                 return
@@ -268,25 +277,48 @@ class CameraWorker:
             log("📷", "CAMERA", f"Camera {self.index} hardware released", "dim")
 
     def _capture_loop(self):
-        log("📷", "CAPTURE", f"Connecting to Video Source: {self.index}")
+        # Determine the correct source: If it's a hardware index, route through Camera Backend to avoid locks
+        source = self.index
+        is_hardware = False
         
-        # Open the capture object
-        self.cap = cv2.VideoCapture(self.index)
+        if isinstance(self.index, (int, float)) or (isinstance(self.index, str) and self.index.isdigit()):
+            is_hardware = True
+            # Pre-check: Is the camera backend even alive?
+            try:
+                # Use a short timeout to check health
+                health_resp = requests.get("http://localhost:8002/health", timeout=1)
+                if health_resp.status_code == 200:
+                    source = f"{STREAM_BACKEND_URL}/{self.index}"
+                    log("🔗", "CAPTURE", f"Routing hardware index {self.index} through Backend Stream: {source}")
+                else:
+                    is_hardware = False # Fallback to direct if health check fails but returns a code
+            except:
+                is_hardware = False # Fallback to direct if backend is totally offline
+        
+        if not is_hardware:
+            log("📷", "CAPTURE", f"Connecting to Video Source: {source}")
+
+        # Open the capture object with specific backend for stability
+        # For URLs (HTTP), CAP_FFMPEG is the most stable on Windows
+        if str(source).startswith("http"):
+            self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        else:
+            self.cap = cv2.VideoCapture(source)
 
         if not self.cap.isOpened():
-            # If it's a string index that is actually a digit, try converting to int
-            if isinstance(self.index, str) and self.index.isdigit():
-                log("⚠️", "CAMERA", f"Retrying as integer index: {self.index}")
+            # Desperate fallback for hardware
+            if is_hardware:
+                log("⚠️", "CAMERA", "Backend stream failed, attempting direct hardware access...")
                 self.cap = cv2.VideoCapture(int(self.index))
             
             if not self.cap.isOpened():
-                log("❌", "CAMERA", f"Video source {self.index} could not be opened! (Is it in use?)", "error")
+                log("❌", "CAMERA", f"Video source {source} could not be opened!", "error")
                 self.status = "Hardware Error"
-                self.error_message = f"Source {self.index} Locked"
+                self.error_message = f"Source {source} Failed"
                 self.running = False
                 return
 
-        log("✅", "CAPTURE", f"Video source {self.index} Opened Successfully")
+        log("✅", "CAPTURE", f"Video source {source} Opened Successfully")
         self.status = "Camera Online"
 
         # Set lower resolution to reduce memory
@@ -559,6 +591,27 @@ async def get_status():
         "active_sessions": len(current_session_info) if current_session_info else 0
     }
 
+@app.get("/system/hardware_cameras")
+async def get_hardware_cameras():
+    """Returns all available camera devices using system-level detection."""
+    try:
+        import subprocess
+        cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
+            unique_names = []
+            for name in lines:
+                if name not in unique_names: unique_names.append(name)
+            
+            cameras = []
+            for idx, name in enumerate(unique_names):
+                cameras.append({"id": str(idx), "name": name})
+            return cameras
+    except Exception as e:
+        log("⚠️", "SYSTEM", f"Hardware detection failed: {e}", "warn")
+    return []
+
 @app.post("/system/toggle")
 async def toggle_system():
     global system_active
@@ -650,15 +703,19 @@ async def video_feed(v: str = "default", cam: str = None):
         
         if target_sess:
             target_url = get_camera_url(target_sess.get('camera_url', '0'), target_sess.get('camera_name'))
-        else:
-            # Session provided but not found/active — DO NOT fallback to camera 0
-            async def error_gen():
-                blank = np.zeros((360, 480, 3), dtype=np.uint8)
-                cv2.putText(blank, "Session Ended", (120, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
-                cv2.putText(blank, f"ID: {v}", (180, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
-                _, buffer = cv2.imencode('.jpg', blank)
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            return StreamingResponse(error_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+        
+        # If still no URL or fallback needed
+        if not target_url:
+            log("📡", "STREAM", f"Session {v} lookup failed. Searching for ANY active camera...", "warn")
+            if camera_workers:
+                # Prioritize a worker that is already running
+                target_url = next(iter(camera_workers.keys()))
+                log("✅", "STREAM", f"Fallback found active worker: {target_url}")
+            elif current_session_info:
+                # If no workers, use the first session in the list
+                s = current_session_info[0]
+                target_url = get_camera_url(s.get('camera_url', '0'), s.get('camera_name'))
+                log("✅", "STREAM", f"Fallback found pending session: {target_url}")
     
     if not target_url:
          # No target (Idle state) — send an idle placeholder instead of opening hardware

@@ -16,32 +16,31 @@ _cameras_lock = threading.Lock()
 
 def find_camera_index_by_label(target_label):
     """
-    Tries to find the hardware index by poking devices directly.
+    Finds the hardware index by matching the friendly name.
+    Ensures that 'Camera A' always maps to the same device even if indices shift.
     """
     if not target_label:
         return None
         
-    print(f"[Camera-Backend] 🔍 Searching hardware for label: {target_label}")
+    print(f"[Camera-Backend] 🔍 Searching hardware for: {target_label}")
     
-    # We'll try a few common indices and see which one matches the label
-    # or just fallback to the label matching if hardware probing is too slow.
-    # For now, let's stick to the list but fix the order by using a more reliable command.
     try:
-        # This command is more specific to video devices
+        # Get list of devices in the order the OS assigns them
         cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
             lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
             
-            # Filter out duplicates and non-camera devices if possible
-            unique_names = []
+            # Map unique names to their OS index
+            unique_devices = []
             for name in lines:
-                if name not in unique_names: unique_names.append(name)
+                if name not in unique_devices: unique_devices.append(name)
             
-            for idx, name in enumerate(unique_names):
+            for idx, name in enumerate(unique_devices):
+                # Check for exact or close match
                 if target_label.lower() in name.lower() or name.lower() in target_label.lower():
-                    print(f"[Camera-Backend] 🎯 Matched label '{target_label}' to hardware index {idx}")
+                    print(f"[Camera-Backend] 🎯 Resolved '{target_label}' to hardware index {idx}")
                     return idx
     except Exception as e:
         print(f"[Camera-Backend] ⚠️ Label lookup failed: {e}")
@@ -115,32 +114,35 @@ def generate_frames(idx):
             time.sleep(2)
 
 @app.get("/video_feed/{idx}")
-async def video_feed(idx: int, label: str = Query(None)):
+async def video_feed(idx: str, label: str = Query(None)):
     """
-    Stream video from a hardware index.
-    If 'label' is provided, it tries to find the current index for that label first.
+    Stream video. 
+    1. If a 'label' is provided, we use it to FIND the correct hardware index.
+    2. If no label or label not found, we use 'idx' as fallback (could be RTSP URL or Index).
     """
     actual_idx = idx
     
-    # We now trust the DB index (idx) by default. 
-    # Label matching is now a DISCOVERY tool, not a mandatory override.
-    if label:
-        print(f"[Camera-Backend] 💡 DB suggests Index {idx} for '{label}'")
-        # We only override if the requested index is -1 or similar
-        if idx < 0:
-            matched_idx = find_camera_index_by_label(label)
-            if matched_idx is not None:
-                actual_idx = matched_idx
+    # Priority 1: Use label to find hardware index (handles Windows index shifting)
+    if label and label.strip():
+        matched_idx = find_camera_index_by_label(label)
+        if matched_idx is not None:
+            actual_idx = matched_idx
+        elif idx.isdigit():
+            actual_idx = int(idx)
+    # Priority 2: Use provided idx directly
+    elif idx.isdigit():
+        actual_idx = int(idx)
             
-    print(f"[Camera-Backend] 📡 New stream request for Camera {actual_idx} (Requested: {idx}, Label: {label})")
+    print(f"[Camera-Backend] 📡 Stream request: Source={actual_idx} (Requested ID={idx}, Label={label})")
     return StreamingResponse(generate_frames(actual_idx), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/health")
 async def health():
-    return {"status": "Camera Backend Online", "cameras_open": list(cameras.keys())}
+    return {"status": "Camera Backend Online", "cameras_active": list(cameras.keys())}
 
 @app.get("/list_cameras")
 async def list_cameras():
+    """Returns a list of all detected hardware cameras with their current indices."""
     try:
         cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -149,18 +151,21 @@ async def list_cameras():
             unique_names = []
             for name in lines:
                 if name not in unique_names: unique_names.append(name)
-            return {"cameras": unique_names}
+            
+            # Return as objects for easier mapping
+            return {"cameras": [{"index": i, "name": name} for i, name in enumerate(unique_names)]}
     except Exception as e:
         return {"error": str(e)}
     return {"cameras": []}
 
 @app.post("/release/{idx}")
-async def release_camera(idx: int):
-    """Explicitly release a hardware camera."""
+async def release_camera(idx: str):
+    """Explicitly release a hardware camera or stream."""
+    actual_idx = int(idx) if idx.isdigit() else idx
     with _cameras_lock:
-        if idx in cameras:
-            cam = cameras[idx]
-            print(f"[Camera-Backend] 🛑 Explicit release requested for Camera {idx}...")
+        if actual_idx in cameras:
+            cam = cameras[actual_idx]
+            print(f"[Camera-Backend] 🛑 Explicit release requested for Source {actual_idx}...")
             cam["running"] = False
             # Wait a moment for threads to notice running=False
             time.sleep(0.1)

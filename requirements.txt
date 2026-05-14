@@ -1,4 +1,4 @@
-deepface
+﻿deepface
 opencv-python
 requests
 numpy

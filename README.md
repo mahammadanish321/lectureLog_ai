@@ -1,1 +1,1 @@
-# lectureLog_ai
+# Merge_ai

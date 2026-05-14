@@ -30,8 +30,8 @@ load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5000/api/recognition")
-STUDENTS_API = os.getenv("STUDENTS_API", "http://localhost:5000/api/students")
-SESSIONS_API = os.getenv("SESSIONS_API", "http://localhost:5000/api/sessions")
+STUDENTS_API = os.getenv("STUDENTS_API", "http://localhost:5000/api/students/public")
+SESSIONS_API = os.getenv("SESSIONS_API", "http://localhost:5000/api/sessions/public")
 CLASSROOMS_API = os.getenv("CLASSROOMS_API", "http://localhost:5000/api/classrooms")
 COOLDOWN_PERIOD = int(os.getenv("COOLDOWN_PERIOD", "30"))
 AI_PORT = int(os.getenv("AI_PORT", "8001"))
@@ -121,9 +121,12 @@ def refresh_student_cache():
         try:
             params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
             sess_resp = requests.get(SESSIONS_API, params=params, timeout=5)
+            log("📡", "SYNC", f"Fetch {SESSIONS_API} - Status: {sess_resp.status_code}", "info")
             if sess_resp.status_code == 200:
                 sessions = sess_resp.json()
+                log("📡", "SYNC", f"Raw sessions count: {len(sessions)}", "info")
                 active_sessions = [s for s in sessions if s.get('status') == 'active']
+                log("📡", "SYNC", f"Filtered active sessions: {len(active_sessions)}", "info")
                 global_error = None
         except Exception as e:
             log("❌", "SYNC", f"Cannot reach backend for sessions: {e}", "error")
@@ -539,7 +542,7 @@ def run_maintenance():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global DeepFace
-    log("🚀", "SYSTEM", "LectureLog AI Service starting...")
+    log("🚀", "SYSTEM", "Merge AI Service starting...")
     log("📋", "SYSTEM", f"Config: threshold={CONFIDENCE_THRESHOLD}, cooldown={COOLDOWN_PERIOD}s, scale={FRAME_SCALE}, interval={RECOGNITION_INTERVAL}s")
     
     # Start a background thread to warm up DeepFace so it doesn't lag the first scan

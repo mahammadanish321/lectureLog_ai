@@ -708,7 +708,7 @@ async def video_feed(v: str = "default", cam: str = None):
             target_url = get_camera_url(target_sess.get('camera_url', '0'), target_sess.get('camera_name'))
         
         # If still no URL or fallback needed
-        if not target_url:
+        if target_url is None:
             log("📡", "STREAM", f"Session {v} lookup failed. Searching for ANY active camera...", "warn")
             if camera_workers:
                 # Prioritize a worker that is already running
@@ -720,7 +720,7 @@ async def video_feed(v: str = "default", cam: str = None):
                 target_url = get_camera_url(s.get('camera_url', '0'), s.get('camera_name'))
                 log("✅", "STREAM", f"Fallback found pending session: {target_url}")
     
-    if not target_url:
+    if target_url is None:
          # No target (Idle state) — send an idle placeholder instead of opening hardware
          async def idle_gen():
             blank = np.zeros((360, 480, 3), dtype=np.uint8)

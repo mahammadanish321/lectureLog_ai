@@ -51,11 +51,6 @@ def log(icon, tag, msg, level="info"):
     c = colors.get(level, "\033[0m")
     print(f"{c}[{ts}] {icon} [{tag}] {msg}\033[0m")
 
-log("🖥️", "SYSTEM", f"Python Executable: {sys.executable}")
-log("🆔", "SYSTEM", f"Python Version: {sys.version}")
-log("📂", "SYSTEM", f"Working Directory: {os.getcwd()}")
-log("⚙️", "SYSTEM", f"Platform: {sys.platform}")
-
 # ── Global State ───────────────────────────────────────────
 system_active = False          # Global system active flag
 student_cache = []
@@ -275,9 +270,7 @@ class CameraWorker:
     def stop(self):
         """Gracefully stop the worker and release the camera."""
         self.running = False
-        if self.cap and self.cap.isOpened():
-            self.cap.release()
-            log("📷", "CAMERA", f"Camera {self.index} hardware released", "dim")
+        log("📷", "CAMERA", f"Stop signal sent to Camera {self.index}", "dim")
 
     def _capture_loop(self):
         # Determine the correct source: If it's a hardware index, route through Camera Backend to avoid locks
@@ -394,6 +387,11 @@ class CameraWorker:
 
             self.latest_frame = display
             time.sleep(0.066)  # ~15 FPS display
+
+        # Clean up hardware when loop exits
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            log("📷", "CAMERA", f"Camera {self.index} hardware released safely", "success")
 
     def _recognition_loop(self):
         global DeepFace
@@ -519,6 +517,7 @@ def run_maintenance():
 
     while True:
         refresh_student_cache()
+        log("💓", "SYSTEM", "AI Health Check: Service is running.", "dim")
 
         # Start camera workers for active sessions
         if system_active and current_session_info:
@@ -800,14 +799,33 @@ async def get_embedding(file: UploadFile = File(...)):
 
 # ── Entry Point ────────────────────────────────────────────
 if __name__ == "__main__":
-    # Suppress noisy uvicorn/asyncio shutdown tracebacks
-    logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
     try:
+        # ── Initial Logs ──
+        log("🖥️", "SYSTEM", f"Python Executable: {sys.executable}")
+        log("🆔", "SYSTEM", f"Python Version: {sys.version}")
+        log("📂", "SYSTEM", f"Working Directory: {os.getcwd()}")
+        log("⚙️", "SYSTEM", f"Platform: {sys.platform}")
+
+        # Suppress noisy uvicorn/asyncio shutdown tracebacks
+        logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+        # Log system readiness info
+        print("\n" + "="*50)
+        print("🚀 MERGE AI SERVICE IS FULLY STARTED")
+        print(f"📡 Listening on: http://localhost:{AI_PORT}")
+        print(f"🏢 Organization: {ORGANIZATION_ID}")
+        print("="*50 + "\n")
+
         uvicorn.run(app, host="0.0.0.0", port=AI_PORT, log_level="warning")
-    except KeyboardInterrupt:
-        pass
+    except Exception as e:
+        import traceback
+        log("💀", "FATAL", f"THE AI SERVICE HAS CRASHED DURING STARTUP!", "error")
+        log("❌", "ERROR", f"Reason: {str(e)}", "error")
+        print("\n--- FULL STACK TRACE ---")
+        traceback.print_exc()
+        print("------------------------\n")
+        sys.exit(1)
     finally:
         log("👋", "SYSTEM", "AI Service stopped. Goodbye!", "info")
         for w in camera_workers.values():

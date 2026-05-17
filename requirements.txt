@@ -1,4 +1,4 @@
-﻿deepface
+deepface
 opencv-python
 requests
 numpy
@@ -8,3 +8,4 @@ fastapi
 uvicorn
 python-multipart
 scipy
+pillow-avif-plugin

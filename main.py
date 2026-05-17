@@ -192,14 +192,15 @@ def refresh_student_cache():
                 student_cache.append(s)
                 seen_ids.add(s['id'])
 
-        # ── Step 6: Start workers for active sessions ──
+        # ── Step 6: Start workers for active sessions and bind session context ──
         if active_sessions:
             for sess in active_sessions:
                 url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
                 worker = _ensure_camera(url)
+                worker.set_session(sess)  # Bind session context (id, year, stream) to this camera worker
                 if not worker.is_scanning:
                     worker.is_scanning = True
-                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url}", "success")
+                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
 
         log("👤", "SYNC", f"Cache updated: {len(student_cache)} students ready for recognition", "success")
 
@@ -260,12 +261,21 @@ class CameraWorker:
         self.is_scanning = False    # Controlled by backend
         self.status = "Initializing Camera..."
         self.error_message = None
+        self.session_id = None      # The active session this camera is serving
+        self.session_year = ''      # Year filter for this session
+        self.session_stream = ''    # Stream filter for this session
         # self.stream_url removed - using self.index directly
         self._last_active_time = time.time()
         self._last_stream_time = time.time()  # Updated by video_feed viewers
 
         threading.Thread(target=self._capture_loop, daemon=True, name=f"cam-{index}-capture").start()
         threading.Thread(target=self._recognition_loop, daemon=True, name=f"cam-{index}-recog").start()
+
+    def set_session(self, session_info):
+        """Bind this camera worker to a specific session for scoped attendance marking."""
+        self.session_id = session_info.get('id') if session_info else None
+        self.session_year = str(session_info.get('year', '')) if session_info else ''
+        self.session_stream = str(session_info.get('stream', '')).lower() if session_info else ''
 
     def stop(self):
         """Gracefully stop the worker and release the camera."""
@@ -464,6 +474,15 @@ class CameraWorker:
 
                     confidence = 1.0 - min_dist
 
+                    # Use session-scoped cache if this worker has session context
+                    # (already filtered globally in refresh_student_cache, but respect per-worker year/stream)
+                    if best_match and self.session_year and self.session_stream:
+                        b_year = str(best_match.get('year', '')).strip()
+                        b_stream = str(best_match.get('stream', '')).strip().lower()
+                        if b_year != self.session_year or b_stream != self.session_stream:
+                            results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
+                            continue
+
                     if best_match and min_dist < (CONFIDENCE_THRESHOLD + 0.05): # Slightly more lenient
                         student_id = best_match['id']
                         student_name = best_match['name']
@@ -475,14 +494,17 @@ class CameraWorker:
                         if student_id not in last_marked or (current_time - last_marked[student_id]) > COOLDOWN_PERIOD:
                             log("✅", f"CAM-{self.index}", f"MATCH: {student_name.upper()} (confidence: {confidence:.1%})", "success")
 
+                            # Use the session_id bound to this camera worker, not the hardcoded 'active'
+                            post_session_id = self.session_id or "active"
                             try:
-                                requests.post(BACKEND_URL, json={
+                                import requests as _req
+                                _req.post(BACKEND_URL, json={
                                     "student_id": student_id,
-                                    "session_id": "active",
+                                    "session_id": post_session_id,
                                     "confidence": confidence
                                 }, timeout=3)
                                 last_marked[student_id] = current_time
-                                log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name}", "success")
+                                log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name} (session {post_session_id})", "success")
                             except Exception as e:
                                 log("❌", f"CAM-{self.index}", f"  → Failed to mark attendance: {e}", "error")
                     elif best_match and min_dist < 0.75: # Increased range for 'Analyzing' feedback
@@ -637,9 +659,10 @@ async def refresh_system(scan: bool = True):
             url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
             needed.add(url)
             worker = _ensure_camera(url)
+            worker.set_session(sess)  # Bind session context so attendance posts to the right session
             if scan:
                 worker.is_scanning = True
-                log("🔍", "SYSTEM", f"Scanning started for Stream {url}", "success")
+                log("🔍", "SYSTEM", f"Scanning started for Stream {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
         
         # Stop any cameras that were running but are no longer in the active sessions
         _cleanup_idle_cameras(exclude=needed)
@@ -760,16 +783,33 @@ async def video_feed(v: str = "default", cam: str = None):
 @app.post("/embed")
 async def get_embedding(file: UploadFile = File(...)):
     """Generate a face embedding from an uploaded image."""
-    temp_path = os.path.join(os.getcwd(), f"temp_{int(time.time())}_{file.filename}")
+    base_name = os.path.splitext(file.filename)[0]
+    # Always save as standard JPEG so OpenCV / DeepFace can read it flawlessly without codec errors
+    temp_path = os.path.join(os.getcwd(), f"temp_{int(time.time())}_{base_name}.jpg")
     log("📁", "EMBED", f"Processing embedding request for: {file.filename}")
     
     try:
-        # Securely write the file
         content = await file.read()
-        with open(temp_path, "wb") as f:
-            f.write(content)
         
-        log("🔍", "EMBED", f"File saved to {temp_path}, starting DeepFace analysis...")
+        try:
+            from PIL import Image
+            import io
+            try:
+                import pillow_avif
+            except ImportError:
+                pass
+            
+            img = Image.open(io.BytesIO(content))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(temp_path, format="JPEG", quality=95)
+            log("🔄", "EMBED", f"Image converted to standard JPEG at {temp_path}")
+        except Exception as pil_err:
+            log("⚠️", "EMBED", f"PIL conversion note: {pil_err}. Saving raw bytes...", "warn")
+            with open(temp_path, "wb") as f:
+                f.write(content)
+        
+        log("🔍", "EMBED", f"File ready at {temp_path}, starting DeepFace analysis...")
         
         try:
             # Try with detection first
@@ -781,7 +821,8 @@ async def get_embedding(file: UploadFile = File(...)):
             
         # Clean up immediately
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try: os.remove(temp_path)
+            except: pass
             
         if objs and len(objs) > 0:
             log("✅", "EMBED", "Embedding generated successfully", "success")

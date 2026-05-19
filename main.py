@@ -783,9 +783,10 @@ async def video_feed(v: str = "default", cam: str = None):
 @app.post("/embed")
 async def get_embedding(file: UploadFile = File(...)):
     """Generate a face embedding from an uploaded image."""
+    import tempfile
     base_name = os.path.splitext(file.filename)[0]
-    # Always save as standard JPEG so OpenCV / DeepFace can read it flawlessly without codec errors
-    temp_path = os.path.join(os.getcwd(), f"temp_{int(time.time())}_{base_name}.jpg")
+    # Always save as standard JPEG so OpenCV / DeepFace can read it flawlessly without codec errors and in a write-safe directory
+    temp_path = os.path.join(tempfile.gettempdir(), f"temp_{int(time.time())}_{base_name}.jpg")
     log("📁", "EMBED", f"Processing embedding request for: {file.filename}")
     
     try:

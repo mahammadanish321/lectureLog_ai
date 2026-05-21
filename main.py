@@ -42,6 +42,15 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
 FRAME_SCALE = float(os.getenv("FRAME_SCALE", "0.4"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 CAMERA_IDLE_TIMEOUT = int(os.getenv("CAMERA_IDLE_TIMEOUT", "60"))
+# CCTV Architecture settings:
+# Set DETECTOR_BACKEND=retinaface for production GPU server; default=mtcnn for laptops
+DETECTOR_BACKEND = os.getenv("DETECTOR_BACKEND", "mtcnn")
+# MIN_FACE_PX: faces smaller than this (px) will be upscaled before recognition
+MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "60"))
+# TILE_GRID: NxN grid to divide frame into for CCTV small-face detection (1=disabled, 2=2x2, etc.)
+TILE_GRID = int(os.getenv("TILE_GRID", "1"))
+# TILE_OVERLAP: fraction of tile size to overlap (prevents faces split at borders)
+TILE_OVERLAP = float(os.getenv("TILE_OVERLAP", "0.15"))
 # CAMERA_BACKEND_URL removed - now using direct hardware access
 
 # ── Logging Helpers ────────────────────────────────────────
@@ -60,6 +69,85 @@ camera_workers = {}            # {cam_index: CameraWorker}
 global_error = None            # Track global service errors
 scanner_enabled = True         # Toggle to enable/disable scanning globally
 _state_lock = threading.Lock()
+
+# ── CCTV Helper Functions ──────────────────────────────────
+def _tile_frame(frame, grid_n, overlap):
+    """
+    Divide a frame into a grid_n x grid_n grid of overlapping tiles.
+    Returns a list of (tile_img, offset_x, offset_y) tuples.
+    Overlap prevents faces from being split at tile borders.
+    """
+    if grid_n <= 1:
+        return [(frame, 0, 0)]
+    
+    h, w = frame.shape[:2]
+    tiles = []
+    step_x = w // grid_n
+    step_y = h // grid_n
+    pad_x = int(step_x * overlap)
+    pad_y = int(step_y * overlap)
+    
+    for row in range(grid_n):
+        for col in range(grid_n):
+            x1 = max(0, col * step_x - pad_x)
+            y1 = max(0, row * step_y - pad_y)
+            x2 = min(w, (col + 1) * step_x + pad_x)
+            y2 = min(h, (row + 1) * step_y + pad_y)
+            tile = frame[y1:y2, x1:x2]
+            tiles.append((tile, x1, y1))
+    
+    return tiles
+
+def _upscale_face(frame, area, target_size=160):
+    """
+    Crop a face from the original high-res frame and upscale it
+    using fast Lanczos interpolation if it is smaller than target_size.
+    Returns the upscaled face crop as a numpy array.
+    """
+    x, y, w, h = area['x'], area['y'], area['w'], area['h']
+    # Clamp to frame bounds
+    x, y = max(0, x), max(0, y)
+    x2 = min(frame.shape[1], x + w)
+    y2 = min(frame.shape[0], y + h)
+    crop = frame[y:y2, x:x2]
+    if crop.size == 0:
+        return None
+    # Only upscale if the face is genuinely small
+    if w < target_size or h < target_size:
+        crop = cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
+    return crop
+
+def _nms_areas(areas, iou_threshold=0.4):
+    """
+    Non-Maximum Suppression: removes duplicate bounding boxes that appear
+    when a face sits on the border of two overlapping tiles.
+    """
+    if len(areas) <= 1:
+        return areas
+    
+    def iou(a, b):
+        ax1, ay1 = a['x'], a['y']
+        ax2, ay2 = ax1 + a['w'], ay1 + a['h']
+        bx1, by1 = b['x'], b['y']
+        bx2, by2 = bx1 + b['w'], by1 + b['h']
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        union = a['w']*a['h'] + b['w']*b['h'] - inter
+        return inter / union if union > 0 else 0.0
+    
+    kept = []
+    used = [False] * len(areas)
+    for i in range(len(areas)):
+        if used[i]:
+            continue
+        kept.append(areas[i])
+        for j in range(i + 1, len(areas)):
+            if not used[j] and iou(areas[i], areas[j]) > iou_threshold:
+                used[j] = True
+    return kept
 
 # ── Helper Functions ───────────────────────────────────────
 def find_camera_index_by_label(target_label):
@@ -160,13 +248,40 @@ def refresh_student_cache():
         all_valid = []
         skipped = 0
         for s in all_students:
+            # Parse the primary (legacy) single embedding
+            has_primary = False
             if s.get('face_embedding'):
                 if isinstance(s['face_embedding'], str):
                     try:
                         s['face_embedding'] = json.loads(s['face_embedding'])
+                        has_primary = True
                     except:
-                        skipped += 1
-                        continue
+                        pass
+                else:
+                    has_primary = True
+
+            # Parse the multi-angle embeddings array (new)
+            # face_embeddings is [[...], [...], ...]
+            if s.get('face_embeddings'):
+                if isinstance(s['face_embeddings'], str):
+                    try:
+                        s['face_embeddings'] = json.loads(s['face_embeddings'])
+                    except:
+                        s['face_embeddings'] = None
+            
+            # Build a flat numpy matrix for fast vectorized cosine matching:
+            # Each row is one embedding angle. Shape: (n_angles, 512)
+            angles = []
+            if s.get('face_embeddings') and isinstance(s['face_embeddings'], list):
+                for emb in s['face_embeddings']:
+                    if isinstance(emb, list) and len(emb) > 0:
+                        angles.append(emb)
+            # Fallback: use the legacy single embedding
+            if not angles and has_primary and isinstance(s['face_embedding'], list):
+                angles.append(s['face_embedding'])
+            
+            if angles:
+                s['_embeddings_matrix'] = np.array(angles, dtype=np.float32)  # (n, 512)
                 all_valid.append(s)
             else:
                 skipped += 1
@@ -494,52 +609,129 @@ class CameraWorker:
             scan_start = time.time()
 
             try:
-                # Use full frame for Facenet512 to ensure accurate facial cropping
-                # (Scaling down destroys alignment precision for this model)
-                process_frame = self._raw_frame
+                raw = self._raw_frame
 
-                # Run DeepFace
-                objs = DeepFace.represent(
-                    img_path=process_frame,
-                    model_name="Facenet512",
-                    enforce_detection=False,
-                    detector_backend="mtcnn"
-                )
+                # ── Phase 1: Grid Tiling ───────────────────────────────
+                # Divides the frame into TILE_GRID x TILE_GRID overlapping tiles.
+                # On 1080p CCTV feeds this keeps far-away faces at their original
+                # resolution so RetinaFace can detect them.
+                # TILE_GRID=1 (default) means no tiling — uses full frame directly.
+                tiles = _tile_frame(raw, TILE_GRID, TILE_OVERLAP)
 
-                if not objs:
+                # ── Phase 2: Detect faces in every tile ───────────────
+                # Collect all raw detected areas (global coords) before NMS.
+                all_detected_areas = []  # list of area dicts in full-frame coords
+
+                for (tile_img, off_x, off_y) in tiles:
+                    try:
+                        tile_objs = DeepFace.extract_faces(
+                            img_path=tile_img,
+                            detector_backend=DETECTOR_BACKEND,
+                            enforce_detection=False,
+                            align=True
+                        )
+                    except Exception:
+                        continue
+
+                    for face_obj in tile_objs:
+                        fa = face_obj.get("facial_area", {})
+                        # Translate tile-local coordinates back to full-frame coords
+                        area = {
+                            'x': int(fa.get('x', 0)) + off_x,
+                            'y': int(fa.get('y', 0)) + off_y,
+                            'w': int(fa.get('w', 0)),
+                            'h': int(fa.get('h', 0))
+                        }
+                        # Skip truly tiny detections (likely false positives)
+                        if area['w'] < 30 or area['h'] < 30:
+                            continue
+                        all_detected_areas.append(area)
+
+                if not all_detected_areas:
                     self.last_recognition_results = []
                     log("👁️", f"CAM-{self.index}", "No faces detected in frame", "dim")
                     continue
 
-                results = []
-                for obj in objs:
-                    fa = obj.get("facial_area", {})
-                    area = {
-                        'x': int(fa.get('x', 0)),
-                        'y': int(fa.get('y', 0)),
-                        'w': int(fa.get('w', 0)),
-                        'h': int(fa.get('h', 0))
-                    }
+                # ── Phase 3: NMS — remove duplicate boxes from tile overlaps ──
+                unique_areas = _nms_areas(all_detected_areas, iou_threshold=0.4)
+                log("👁️", f"CAM-{self.index}", f"{len(all_detected_areas)} raw detections → {len(unique_areas)} unique after NMS", "dim")
 
-                    # Skip tiny faces (likely false positives)
-                    if area['w'] < 30 or area['h'] < 30:
+                # ── Phase 4: Targeted Upscaling + Embedding ───────────
+                # For each unique face, crop it from the raw high-res frame.
+                # If the face is small (CCTV back-row student), upscale it with
+                # Lanczos4 before passing to Facenet512. Fast, no extra models needed.
+                results = []
+                total_faces = 0
+
+                for area in unique_areas:
+                    # Crop & optionally upscale the face from the ORIGINAL high-res frame
+                    face_crop = _upscale_face(raw, area, target_size=160)
+                    if face_crop is None:
                         continue
 
-                    embedding = obj["embedding"]
+                    if area['w'] < MIN_FACE_PX or area['h'] < MIN_FACE_PX:
+                        log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 160x160 with Lanczos4", "dim")
 
-                    # Find best match
+                    try:
+                        # detector_backend="skip" tells DeepFace to trust our crop
+                        # and skip re-detection, going straight to embedding extraction
+                        embed_objs = DeepFace.represent(
+                            img_path=face_crop,
+                            model_name="Facenet512",
+                            enforce_detection=False,
+                            detector_backend="skip"
+                        )
+                    except Exception as embed_err:
+                        log("⚠️", f"CAM-{self.index}", f"Embedding failed for a face: {embed_err}", "warn")
+                        continue
+
+                    if not embed_objs:
+                        continue
+
+                    embedding = embed_objs[0]["embedding"]
+                    total_faces += 1
+
+                    # ── Phase 5: Fast numpy multi-angle cosine matching ─
+                    # Build a unit-normalised query vector for cosine similarity.
+                    # For each student we have a matrix of shape (n_angles, 512).
+                    # We compute the distance to every angle in one numpy dot-product call
+                    # and take the minimum (best angle match). This is ~10x faster than
+                    # a Python for-loop and handles multi-angle registrations automatically.
+                    query = np.array(embedding, dtype=np.float32)
+                    q_norm = np.linalg.norm(query)
+                    if q_norm > 0:
+                        query = query / q_norm
+
                     best_match = None
                     min_dist = 1.0
                     for s in student_cache:
-                        d = cosine(embedding, s['face_embedding'])
+                        mat = s.get('_embeddings_matrix')  # shape (n_angles, 512)
+                        if mat is None:
+                            # Fallback for students not yet processed through new cache
+                            try:
+                                d = cosine(embedding, s['face_embedding'])
+                                if d < min_dist:
+                                    min_dist = d
+                                    best_match = s
+                            except:
+                                pass
+                            continue
+                        # Normalize each row (angle embedding) and compute cosine distances
+                        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                        norms = np.where(norms == 0, 1, norms)  # avoid div-by-zero
+                        mat_normed = mat / norms  # (n_angles, 512)
+                        # dot product of query (512,) with each row = cosine similarity
+                        sims = mat_normed @ query  # (n_angles,)
+                        # cosine distance = 1 - similarity; take the best angle
+                        d = float(1.0 - np.max(sims))
                         if d < min_dist:
                             min_dist = d
                             best_match = s
 
                     confidence = 1.0 - min_dist
 
-                    # Use session-scoped cache if this worker has session context
-                    # (already filtered globally in refresh_student_cache, but respect per-worker year/stream)
+                    # Session-scope guard: only accept students from this camera's year/stream
+                    # (already filtered globally in refresh_student_cache, but belt-and-braces check)
                     if best_match and self.session_year and self.session_stream:
                         b_year = str(best_match.get('year', '')).strip()
                         b_stream = str(best_match.get('stream', '')).strip().lower()
@@ -551,14 +743,13 @@ class CameraWorker:
                         student_id = best_match['id']
                         student_name = best_match['name']
                         current_time = time.time()
-                        
+
                         results.append({'name': student_name, 'confidence': confidence, 'area': area})
 
-                        # Check cooldown before marking (only mark and log if they are NOT in cooldown)
+                        # Check cooldown — never double-mark within COOLDOWN_PERIOD
                         if student_id not in last_marked or (current_time - last_marked[student_id]) > COOLDOWN_PERIOD:
                             log("✅", f"CAM-{self.index}", f"MATCH: {student_name.upper()} (confidence: {confidence:.1%})", "success")
 
-                            # Use the session_id bound to this camera worker
                             post_session_id = self.session_id or "active"
                             try:
                                 import requests as _req
@@ -571,33 +762,35 @@ class CameraWorker:
                                 log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name} (session {post_session_id})", "success")
                             except Exception as e:
                                 log("❌", f"CAM-{self.index}", f"  → Failed to mark attendance: {e}", "error")
-                                
-                    elif best_match and min_dist < 0.75: # Increased range for 'Analyzing' feedback
+
+                    elif best_match and min_dist < 0.75:
                         results.append({'name': "ANALYZING", 'confidence': confidence, 'area': area})
-                        log("🔍", f"CAM-{self.index}", f"Low confidence face: closest to {best_match['name']} ({confidence:.1%})", "warn")
+                        log("🔍", f"CAM-{self.index}", f"Low confidence: closest to {best_match['name']} ({confidence:.1%})", "warn")
                     else:
                         results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
 
                 self.last_recognition_results = results
                 self.last_recognition_time = time.time()
 
+                # ── Sticky Tracker Update ─────────────────────────────
+                # The fast Haar-cascade tracker (in _capture_loop) uses
+                # self.tracked_faces to keep boxes smooth between AI scans.
+                # We preserve known identities to prevent flickering to UNKNOWN.
                 if getattr(self, 'use_tracking', False):
                     new_tracked = []
                     for res in results:
                         area = res.get('area', {})
                         new_bbox = [area.get('x',0), area.get('y',0), area.get('w',0), area.get('h',0)]
                         ncx, ncy = new_bbox[0] + new_bbox[2]/2, new_bbox[1] + new_bbox[3]/2
-                        
+
                         preserved_name = res.get('name', '')
                         preserved_conf = res.get('confidence', 0)
-                        
+
                         if preserved_name in ["UNKNOWN", "ANALYZING"]:
-                            # Preserve known identity if AI had a temporary confidence drop but tracker knows who it is
                             for t in getattr(self, 'tracked_faces', []):
                                 tx, ty, tw, th = t.get('bbox', [0,0,0,0])
                                 tcx, tcy = tx + tw/2, ty + th/2
                                 dist = ((ncx - tcx)**2 + (ncy - tcy)**2)**0.5
-                                # More generous distance check that scales with face size
                                 if dist < max(tw, th, 150) and t.get('name') not in ["UNKNOWN", "ANALYZING", ""]:
                                     preserved_name = t['name']
                                     preserved_conf = t['confidence']
@@ -612,9 +805,8 @@ class CameraWorker:
                     self.tracked_faces = new_tracked
 
                 elapsed = time.time() - scan_start
-                log("⏱️", f"CAM-{self.index}", f"Scan complete: {len(objs)} face(s) processed in {elapsed:.1f}s", "dim")
-                
-                # If we reached here, recognition is working
+                log("⏱️", f"CAM-{self.index}", f"Scan complete: {total_faces} face(s) | tiles={len(tiles)} | detector={DETECTOR_BACKEND} | {elapsed:.1f}s", "dim")
+
                 self.status = "AI Scanning Active"
                 self.error_message = None
 

@@ -256,6 +256,13 @@ class CameraWorker:
         self._raw_frame = None      # Raw frame for recognition (no overlays)
         self.running = True
         self.last_recognition_results = []  # [{name, confidence, area}]
+        self.last_recognition_time = 0
+        self.tracked_faces = []
+        try:
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            self.use_tracking = not self.face_cascade.empty()
+        except:
+            self.use_tracking = False
         self._recognition_lock = threading.Lock()
         self._recognition_busy = False
         self.is_scanning = False    # Controlled by backend
@@ -358,25 +365,84 @@ class CameraWorker:
             # Build display frame with overlays
             display = frame.copy()
 
-            # Draw recognition results on display frame
-            for result in self.last_recognition_results:
-                area = result.get('area', {})
-                x, y, w, h = area.get('x', 0), area.get('y', 0), area.get('w', 0), area.get('h', 0)
-                name = result.get('name', '')
-                confidence = result.get('confidence', 0)
+            if getattr(self, 'use_tracking', False):
+                # Smooth tracking by matching AI results to live fast-detections
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                small_gray = cv2.resize(gray, (320, 240))
+                scale_x = frame.shape[1] / 320.0
+                scale_y = frame.shape[0] / 240.0
+                
+                live_faces = self.face_cascade.detectMultiScale(small_gray, 1.1, 4)
+                
+                current_tracked = []
+                for (lx, ly, lw, lh) in live_faces:
+                    lx, ly, lw, lh = int(lx*scale_x), int(ly*scale_y), int(lw*scale_x), int(lh*scale_y)
+                    lcx, lcy = lx + lw/2, ly + lh/2
+                    best_match = None
+                    min_dist = 150
+                    
+                    for t in self.tracked_faces:
+                        tx, ty, tw, th = t.get('bbox', [0,0,0,0])
+                        tcx, tcy = tx + tw/2, ty + th/2
+                        dist = ((lcx - tcx)**2 + (lcy - tcy)**2)**0.5
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_match = t
+                            
+                    if best_match:
+                        best_match['bbox'] = [lx, ly, lw, lh]
+                        best_match['last_seen'] = time.time()
+                        current_tracked.append(best_match)
+                        
+                for t in self.tracked_faces:
+                    if t not in current_tracked and (time.time() - t.get('last_seen', 0)) < 1.0:
+                        current_tracked.append(t)
+                        
+                self.tracked_faces = current_tracked
 
-                if name == "UNKNOWN":
-                    color = (0, 0, 200)  # Red
-                    label = "UNKNOWN"
-                elif name == "ANALYZING":
-                    color = (0, 200, 200)  # Yellow
-                    label = "ANALYZING..."
-                else:
-                    color = (0, 200, 0)  # Green
-                    label = f"{name.upper()} ({confidence:.0%})"
+                for t in self.tracked_faces:
+                    if time.time() - t.get('last_seen', 0) > 1.5:
+                        continue
+                    x, y, w, h = t['bbox']
+                    name = t.get('name', '')
+                    confidence = t.get('confidence', 0)
 
-                cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(display, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    if name == "UNKNOWN":
+                        color = (0, 0, 200)
+                        label = "UNKNOWN"
+                    elif name == "ANALYZING":
+                        color = (0, 200, 200)
+                        label = "ANALYZING..."
+                    else:
+                        color = (0, 200, 0)
+                        label = f"{name.upper()} ({confidence:.0%})"
+
+                    cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(display, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            else:
+                # Clear old boxes after 1.5 seconds so they don't look stuck
+                if time.time() - self.last_recognition_time > 1.5:
+                    self.last_recognition_results = []
+
+                # Draw recognition results on display frame
+                for result in self.last_recognition_results:
+                    area = result.get('area', {})
+                    x, y, w, h = area.get('x', 0), area.get('y', 0), area.get('w', 0), area.get('h', 0)
+                    name = result.get('name', '')
+                    confidence = result.get('confidence', 0)
+
+                    if name == "UNKNOWN":
+                        color = (0, 0, 200)  # Red
+                        label = "UNKNOWN"
+                    elif name == "ANALYZING":
+                        color = (0, 200, 200)  # Yellow
+                        label = "ANALYZING..."
+                    else:
+                        color = (0, 200, 0)  # Green
+                        label = f"{name.upper()} ({confidence:.0%})"
+
+                    cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(display, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Status bar
             status_text = self.status
@@ -428,15 +494,16 @@ class CameraWorker:
             scan_start = time.time()
 
             try:
-                # Resize for faster processing
-                small = cv2.resize(self._raw_frame, (0, 0), fx=FRAME_SCALE, fy=FRAME_SCALE)
+                # Use full frame for Facenet512 to ensure accurate facial cropping
+                # (Scaling down destroys alignment precision for this model)
+                process_frame = self._raw_frame
 
                 # Run DeepFace
                 objs = DeepFace.represent(
-                    img_path=small,
-                    model_name="VGG-Face",
+                    img_path=process_frame,
+                    model_name="Facenet512",
                     enforce_detection=False,
-                    detector_backend="opencv"
+                    detector_backend="mtcnn"
                 )
 
                 if not objs:
@@ -445,16 +512,13 @@ class CameraWorker:
                     continue
 
                 results = []
-                scale_inv = 1.0 / FRAME_SCALE
-
                 for obj in objs:
                     fa = obj.get("facial_area", {})
-                    # Scale facial area back to original frame coords
                     area = {
-                        'x': int(fa.get('x', 0) * scale_inv),
-                        'y': int(fa.get('y', 0) * scale_inv),
-                        'w': int(fa.get('w', 0) * scale_inv),
-                        'h': int(fa.get('h', 0) * scale_inv)
+                        'x': int(fa.get('x', 0)),
+                        'y': int(fa.get('y', 0)),
+                        'w': int(fa.get('w', 0)),
+                        'h': int(fa.get('h', 0))
                     }
 
                     # Skip tiny faces (likely false positives)
@@ -483,18 +547,18 @@ class CameraWorker:
                             results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
                             continue
 
-                    if best_match and min_dist < (CONFIDENCE_THRESHOLD + 0.05): # Slightly more lenient
+                    if best_match and min_dist < CONFIDENCE_THRESHOLD:
                         student_id = best_match['id']
                         student_name = best_match['name']
                         current_time = time.time()
-
+                        
                         results.append({'name': student_name, 'confidence': confidence, 'area': area})
 
-                        # Check cooldown before marking
+                        # Check cooldown before marking (only mark and log if they are NOT in cooldown)
                         if student_id not in last_marked or (current_time - last_marked[student_id]) > COOLDOWN_PERIOD:
                             log("✅", f"CAM-{self.index}", f"MATCH: {student_name.upper()} (confidence: {confidence:.1%})", "success")
 
-                            # Use the session_id bound to this camera worker, not the hardcoded 'active'
+                            # Use the session_id bound to this camera worker
                             post_session_id = self.session_id or "active"
                             try:
                                 import requests as _req
@@ -507,14 +571,45 @@ class CameraWorker:
                                 log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name} (session {post_session_id})", "success")
                             except Exception as e:
                                 log("❌", f"CAM-{self.index}", f"  → Failed to mark attendance: {e}", "error")
+                                
                     elif best_match and min_dist < 0.75: # Increased range for 'Analyzing' feedback
-                        # Low confidence — face detected but not sure
                         results.append({'name': "ANALYZING", 'confidence': confidence, 'area': area})
-                        log("🔍", f"CAM-{self.index}", f"Low confidence face: closest to {best_match['name']} ({confidence:.1%}) — trying to confirm...", "warn")
+                        log("🔍", f"CAM-{self.index}", f"Low confidence face: closest to {best_match['name']} ({confidence:.1%})", "warn")
                     else:
                         results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
 
                 self.last_recognition_results = results
+                self.last_recognition_time = time.time()
+
+                if getattr(self, 'use_tracking', False):
+                    new_tracked = []
+                    for res in results:
+                        area = res.get('area', {})
+                        new_bbox = [area.get('x',0), area.get('y',0), area.get('w',0), area.get('h',0)]
+                        ncx, ncy = new_bbox[0] + new_bbox[2]/2, new_bbox[1] + new_bbox[3]/2
+                        
+                        preserved_name = res.get('name', '')
+                        preserved_conf = res.get('confidence', 0)
+                        
+                        if preserved_name in ["UNKNOWN", "ANALYZING"]:
+                            # Preserve known identity if AI had a temporary confidence drop but tracker knows who it is
+                            for t in getattr(self, 'tracked_faces', []):
+                                tx, ty, tw, th = t.get('bbox', [0,0,0,0])
+                                tcx, tcy = tx + tw/2, ty + th/2
+                                dist = ((ncx - tcx)**2 + (ncy - tcy)**2)**0.5
+                                # More generous distance check that scales with face size
+                                if dist < max(tw, th, 150) and t.get('name') not in ["UNKNOWN", "ANALYZING", ""]:
+                                    preserved_name = t['name']
+                                    preserved_conf = t['confidence']
+                                    break
+
+                        new_tracked.append({
+                            'name': preserved_name,
+                            'confidence': preserved_conf,
+                            'bbox': new_bbox,
+                            'last_seen': time.time()
+                        })
+                    self.tracked_faces = new_tracked
 
                 elapsed = time.time() - scan_start
                 log("⏱️", f"CAM-{self.index}", f"Scan complete: {len(objs)} face(s) processed in {elapsed:.1f}s", "dim")
@@ -575,7 +670,7 @@ async def lifespan(app: FastAPI):
             DeepFace = DF
             # Pre-load VGG-Face by doing a dummy representation
             dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-            DeepFace.represent(dummy, model_name="VGG-Face", enforce_detection=False)
+            DeepFace.represent(dummy, model_name="Facenet512", enforce_detection=False)
             log("✨", "AI", "Background warmup complete. Scanning will be fast.", "success")
         except Exception as e:
             log("⚠️", "AI", f"Warmup failed: {e}", "warn")
@@ -813,11 +908,11 @@ async def get_embedding(file: UploadFile = File(...)):
         
         try:
             # Try with detection first
-            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=True, detector_backend="opencv")
+            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=True, detector_backend="mtcnn")
         except Exception as detection_err:
             log("⚠️", "EMBED", f"Face detection failed: {detection_err}. Retrying without enforcement...", "warn")
             # Fallback: retry without enforcement
-            objs = DeepFace.represent(img_path=temp_path, model_name="VGG-Face", enforce_detection=False, detector_backend="opencv")
+            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=False, detector_backend="mtcnn")
             
         # Clean up immediately
         if os.path.exists(temp_path):

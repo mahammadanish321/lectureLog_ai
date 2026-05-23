@@ -1068,7 +1068,7 @@ async def video_feed(v: str = "default", cam: str = None):
     return StreamingResponse(frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.post("/embed")
-async def get_embedding(file: UploadFile = File(...)):
+def get_embedding(file: UploadFile = File(...)):
     """Generate a face embedding from an uploaded image."""
     base_name = os.path.splitext(file.filename)[0]
     # Always save as standard JPEG so OpenCV / DeepFace can read it flawlessly without codec errors
@@ -1076,7 +1076,7 @@ async def get_embedding(file: UploadFile = File(...)):
     log("📁", "EMBED", f"Processing embedding request for: {file.filename}")
     
     try:
-        content = await file.read()
+        content = file.file.read()
         
         try:
             from PIL import Image
@@ -1099,12 +1099,12 @@ async def get_embedding(file: UploadFile = File(...)):
         log("🔍", "EMBED", f"File ready at {temp_path}, starting DeepFace analysis...")
         
         try:
-            # Try with detection first
-            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=True, detector_backend="mtcnn")
+            # Try with detection first using blazing fast opencv
+            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=True, detector_backend="opencv")
         except Exception as detection_err:
             log("⚠️", "EMBED", f"Face detection failed: {detection_err}. Retrying without enforcement...", "warn")
             # Fallback: retry without enforcement
-            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=False, detector_backend="mtcnn")
+            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=False, detector_backend="opencv")
             
         # Clean up immediately
         if os.path.exists(temp_path):

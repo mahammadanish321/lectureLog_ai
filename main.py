@@ -38,19 +38,14 @@ AI_PORT = int(os.getenv("AI_PORT", "8001"))
 STREAM_BACKEND_URL = os.getenv("STREAM_BACKEND_URL", "http://localhost:8002/video_feed")
 ORGANIZATION_ID = os.getenv("ORGANIZATION_ID") # Used for multi-tenancy isolation
 RECOGNITION_INTERVAL = float(os.getenv("RECOGNITION_INTERVAL", "3.0"))
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.28"))
+# Minimum margin between best and second-best match to accept a recognition
+MARGIN_OF_VICTORY = float(os.getenv("MARGIN_OF_VICTORY", "0.08"))
+# Minimum face detection confidence to accept (filters phantom detections)
+MIN_FACE_CONFIDENCE = float(os.getenv("MIN_FACE_CONFIDENCE", "0.80"))
 FRAME_SCALE = float(os.getenv("FRAME_SCALE", "0.4"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 CAMERA_IDLE_TIMEOUT = int(os.getenv("CAMERA_IDLE_TIMEOUT", "60"))
-# CCTV Architecture settings:
-# Set DETECTOR_BACKEND=retinaface for production GPU server; default=mtcnn for laptops
-DETECTOR_BACKEND = os.getenv("DETECTOR_BACKEND", "mtcnn")
-# MIN_FACE_PX: faces smaller than this (px) will be upscaled before recognition
-MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "60"))
-# TILE_GRID: NxN grid to divide frame into for CCTV small-face detection (1=disabled, 2=2x2, etc.)
-TILE_GRID = int(os.getenv("TILE_GRID", "1"))
-# TILE_OVERLAP: fraction of tile size to overlap (prevents faces split at borders)
-TILE_OVERLAP = float(os.getenv("TILE_OVERLAP", "0.15"))
 # CAMERA_BACKEND_URL removed - now using direct hardware access
 
 # ── Logging Helpers ────────────────────────────────────────
@@ -63,7 +58,7 @@ def log(icon, tag, msg, level="info"):
 # ── Global State ───────────────────────────────────────────
 system_active = False          # Global system active flag
 student_cache = []
-last_marked = {}               # {student_id: timestamp}
+last_marked = {}               # {(student_id, session_id): timestamp}
 current_session_info = None    # List of active sessions or None
 camera_workers = {}            # {cam_index: CameraWorker}
 global_error = None            # Track global service errors
@@ -233,7 +228,7 @@ def refresh_student_cache():
 
         # ── Step 3: Fetch students ──
         try:
-            params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
+            params = {"organization_id": ORGANIZATION_ID, "verified_only": "true"} if ORGANIZATION_ID else {"verified_only": "true"}
             response = requests.get(STUDENTS_API, params=params, timeout=5)
             if response.status_code != 200:
                 log("❌", "SYNC", f"Students API returned {response.status_code}", "error")
@@ -311,7 +306,9 @@ def refresh_student_cache():
         if active_sessions:
             for sess in active_sessions:
                 url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
-                worker = _ensure_camera(url)
+                camera_type = sess.get('camera_type', 'webcam')
+                camera_quality = sess.get('camera_quality', '720p')
+                worker = _ensure_camera(url, camera_type, camera_quality)
                 worker.set_session(sess)  # Bind session context (id, year, stream) to this camera worker
                 if not worker.is_scanning:
                     worker.is_scanning = True
@@ -354,18 +351,33 @@ def _cleanup_idle_cameras(exclude=None, force=False):
             del camera_workers[idx]
             log("📷", "CLEANUP", f"Camera {idx} released (no active sessions)", "dim")
 
-def _ensure_camera(cam_url):
+def _ensure_camera(cam_url, camera_type='webcam', camera_quality='720p'):
     """Start a camera worker if not already running."""
     with _state_lock:
         if cam_url not in camera_workers:
             log("📸", "CAMERA", f"Initializing AI Worker for Stream: {cam_url}...", "info")
-            camera_workers[cam_url] = CameraWorker(cam_url)
+            camera_workers[cam_url] = CameraWorker(cam_url, camera_type, camera_quality)
         return camera_workers[cam_url]
 
 # ── Camera Worker (Optimized) ──────────────────────────────
 class CameraWorker:
-    def __init__(self, index):
+    def __init__(self, index, camera_type='webcam', camera_quality='720p'):
         self.index = index
+        self.camera_type = str(camera_type).lower()
+        self.camera_quality = str(camera_quality).lower()
+
+        # Dynamic Configuration Based on DB settings
+        if self.camera_type == 'cctv':
+            self.detector_backend = 'retinaface'
+            self.min_face_px = 40 if self.camera_quality in ['1080p', '4k'] else 60
+            self.tile_grid = 2 if self.camera_quality in ['1080p', '4k'] else 1
+            self.tile_overlap = 0.15
+        else:
+            self.detector_backend = 'mtcnn'
+            self.min_face_px = 60
+            self.tile_grid = 1
+            self.tile_overlap = 0.0
+
         self.cap = None
         self.latest_frame = np.zeros((360, 480, 3), dtype=np.uint8)  # Smaller default
         self._raw_frame = None      # Raw frame for recognition (no overlays)
@@ -398,6 +410,18 @@ class CameraWorker:
         self.session_id = session_info.get('id') if session_info else None
         self.session_year = str(session_info.get('year', '')) if session_info else ''
         self.session_stream = str(session_info.get('stream', '')).lower() if session_info else ''
+        # Dynamic per-camera AI settings based on classroom config
+        cam_type = str(session_info.get('camera_type', 'webcam')).lower() if session_info else 'webcam'
+        cam_quality = str(session_info.get('camera_quality', '720p')).lower() if session_info else '720p'
+        if cam_type == 'cctv':
+            self.detector_backend = 'retinaface'
+            self.tile_grid = 2 if cam_quality in ('1080p', '4k') else 1
+            self.min_face_px = 40 if cam_quality in ('1080p', '4k') else 60
+        else:
+            self.detector_backend = 'mtcnn'
+            self.tile_grid = 1
+            self.min_face_px = 60
+        log("⚙️", f"CAM-{self.index}", f"AI Config: type={cam_type}, quality={cam_quality} → detector={self.detector_backend}, tiles={self.tile_grid}x{self.tile_grid}, min_face={self.min_face_px}px", "info")
 
     def stop(self):
         """Gracefully stop the worker and release the camera."""
@@ -612,11 +636,11 @@ class CameraWorker:
                 raw = self._raw_frame
 
                 # ── Phase 1: Grid Tiling ───────────────────────────────
-                # Divides the frame into TILE_GRID x TILE_GRID overlapping tiles.
+                # Divides the frame into self.tile_grid x self.tile_grid overlapping tiles.
                 # On 1080p CCTV feeds this keeps far-away faces at their original
                 # resolution so RetinaFace can detect them.
-                # TILE_GRID=1 (default) means no tiling — uses full frame directly.
-                tiles = _tile_frame(raw, TILE_GRID, TILE_OVERLAP)
+                # tile_grid=1 (default) means no tiling — uses full frame directly.
+                tiles = _tile_frame(raw, self.tile_grid, self.tile_overlap)
 
                 # ── Phase 2: Detect faces in every tile ───────────────
                 # Collect all raw detected areas (global coords) before NMS.
@@ -626,7 +650,7 @@ class CameraWorker:
                     try:
                         tile_objs = DeepFace.extract_faces(
                             img_path=tile_img,
-                            detector_backend=DETECTOR_BACKEND,
+                            detector_backend=self.detector_backend,
                             enforce_detection=False,
                             align=True
                         )
@@ -634,6 +658,14 @@ class CameraWorker:
                         continue
 
                     for face_obj in tile_objs:
+                        # ── CRITICAL FIX: Filter phantom detections ──
+                        # When enforce_detection=False and no face exists, DeepFace
+                        # returns the entire frame as a "face" with confidence=0.
+                        # We MUST reject these to prevent matching walls/backgrounds.
+                        det_confidence = face_obj.get("confidence", 0)
+                        if det_confidence < MIN_FACE_CONFIDENCE:
+                            continue  # Skip phantom/low-quality detections
+
                         fa = face_obj.get("facial_area", {})
                         # Translate tile-local coordinates back to full-frame coords
                         area = {
@@ -669,7 +701,7 @@ class CameraWorker:
                     if face_crop is None:
                         continue
 
-                    if area['w'] < MIN_FACE_PX or area['h'] < MIN_FACE_PX:
+                    if area['w'] < self.min_face_px or area['h'] < self.min_face_px:
                         log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 160x160 with Lanczos4", "dim")
 
                     try:
@@ -689,6 +721,15 @@ class CameraWorker:
                         continue
 
                     embedding = embed_objs[0]["embedding"]
+
+                    # ── Quality gate: validate embedding L2 norm ──
+                    # Valid Facenet512 embeddings have norms in a predictable range (~15-40).
+                    # Non-face crops produce embeddings with abnormal norms.
+                    emb_norm = float(np.linalg.norm(embedding))
+                    if emb_norm < 10.0 or emb_norm > 40.0:
+                        log("⚠️", f"CAM-{self.index}", f"Skipping low-quality embedding (norm={emb_norm:.1f})", "warn")
+                        continue
+
                     total_faces += 1
 
                     # ── Phase 5: Fast numpy multi-angle cosine matching ─
@@ -704,15 +745,28 @@ class CameraWorker:
 
                     best_match = None
                     min_dist = 1.0
-                    for s in student_cache:
+                    second_min_dist = 1.0  # Track second-best for margin-of-victory
+
+                    # ── Scope student cache to this camera's session ──
+                    # Filter BEFORE matching so we only compare against the correct group
+                    session_students = student_cache
+                    if self.session_year and self.session_stream:
+                        session_students = [s for s in student_cache
+                            if str(s.get('year', '')).strip() == self.session_year
+                            and str(s.get('stream', '')).strip().lower() == self.session_stream]
+
+                    for s in session_students:
                         mat = s.get('_embeddings_matrix')  # shape (n_angles, 512)
                         if mat is None:
                             # Fallback for students not yet processed through new cache
                             try:
                                 d = cosine(embedding, s['face_embedding'])
                                 if d < min_dist:
+                                    second_min_dist = min_dist
                                     min_dist = d
                                     best_match = s
+                                elif d < second_min_dist:
+                                    second_min_dist = d
                             except:
                                 pass
                             continue
@@ -725,18 +779,22 @@ class CameraWorker:
                         # cosine distance = 1 - similarity; take the best angle
                         d = float(1.0 - np.max(sims))
                         if d < min_dist:
+                            second_min_dist = min_dist
                             min_dist = d
                             best_match = s
+                        elif d < second_min_dist:
+                            second_min_dist = d
 
                     confidence = 1.0 - min_dist
 
-                    # Session-scope guard: only accept students from this camera's year/stream
-                    # (already filtered globally in refresh_student_cache, but belt-and-braces check)
-                    if best_match and self.session_year and self.session_stream:
-                        b_year = str(best_match.get('year', '')).strip()
-                        b_stream = str(best_match.get('stream', '')).strip().lower()
-                        if b_year != self.session_year or b_stream != self.session_stream:
-                            results.append({'name': "UNKNOWN", 'confidence': 0, 'area': area})
+                    # ── Margin-of-victory check ──
+                    # Prevent misidentification: the best match must be clearly better
+                    # than the second-best. If two students look similar, reject.
+                    if best_match and min_dist < CONFIDENCE_THRESHOLD:
+                        margin = second_min_dist - min_dist
+                        if margin < MARGIN_OF_VICTORY and second_min_dist < 0.5:
+                            log("⚠️", f"CAM-{self.index}", f"Ambiguous match: {best_match['name']} (d={min_dist:.3f}) vs second-best (d={second_min_dist:.3f}), margin={margin:.3f} < {MARGIN_OF_VICTORY}", "warn")
+                            results.append({'name': "ANALYZING", 'confidence': confidence, 'area': area})
                             continue
 
                     if best_match and min_dist < CONFIDENCE_THRESHOLD:
@@ -747,8 +805,10 @@ class CameraWorker:
                         results.append({'name': student_name, 'confidence': confidence, 'area': area})
 
                         # Check cooldown — never double-mark within COOLDOWN_PERIOD
-                        if student_id not in last_marked or (current_time - last_marked[student_id]) > COOLDOWN_PERIOD:
-                            log("✅", f"CAM-{self.index}", f"MATCH: {student_name.upper()} (confidence: {confidence:.1%})", "success")
+                        # Cooldown is per (student, session) so it doesn't bleed across sessions
+                        cooldown_key = (student_id, self.session_id or 'active')
+                        if cooldown_key not in last_marked or (current_time - last_marked[cooldown_key]) > COOLDOWN_PERIOD:
+                            log("✅", f"CAM-{self.index}", f"MATCH: {student_name.upper()} (confidence: {confidence:.1%}, margin: {(second_min_dist - min_dist):.3f})", "success")
 
                             post_session_id = self.session_id or "active"
                             try:
@@ -758,7 +818,7 @@ class CameraWorker:
                                     "session_id": post_session_id,
                                     "confidence": confidence
                                 }, timeout=3)
-                                last_marked[student_id] = current_time
+                                last_marked[cooldown_key] = current_time
                                 log("📝", f"CAM-{self.index}", f"  → Attendance marked for {student_name} (session {post_session_id})", "success")
                             except Exception as e:
                                 log("❌", f"CAM-{self.index}", f"  → Failed to mark attendance: {e}", "error")
@@ -805,7 +865,7 @@ class CameraWorker:
                     self.tracked_faces = new_tracked
 
                 elapsed = time.time() - scan_start
-                log("⏱️", f"CAM-{self.index}", f"Scan complete: {total_faces} face(s) | tiles={len(tiles)} | detector={DETECTOR_BACKEND} | {elapsed:.1f}s", "dim")
+                log("⏱️", f"CAM-{self.index}", f"Scan complete: {total_faces} face(s) | tiles={len(tiles)} | detector={self.detector_backend} | {elapsed:.1f}s", "dim")
 
                 self.status = "AI Scanning Active"
                 self.error_message = None
@@ -1098,13 +1158,37 @@ def get_embedding(file: UploadFile = File(...)):
         
         log("🔍", "EMBED", f"File ready at {temp_path}, starting DeepFace analysis...")
         
-        try:
-            # Try with detection first using blazing fast opencv
-            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=True, detector_backend="opencv")
-        except Exception as detection_err:
-            log("⚠️", "EMBED", f"Face detection failed: {detection_err}. Retrying without enforcement...", "warn")
-            # Fallback: retry without enforcement
-            objs = DeepFace.represent(img_path=temp_path, model_name="Facenet512", enforce_detection=False, detector_backend="opencv")
+        # Try face detection with a list of backends (mtcnn first, then retinaface, then opencv)
+        detector_backends = ["mtcnn", "retinaface", "opencv"]
+        objs = None
+        detection_err = None
+        for backend in detector_backends:
+            try:
+                log("🔍", "EMBED", f"Attempting DeepFace represent using {backend}...")
+                objs = DeepFace.represent(
+                    img_path=temp_path,
+                    model_name="Facenet512",
+                    enforce_detection=True,
+                    detector_backend=backend
+                )
+                if objs and len(objs) > 0:
+                    log("✅", "EMBED", f"Face detected successfully using {backend}")
+                    break
+            except Exception as e:
+                log("⚠️", "EMBED", f"Face detection failed using {backend}: {e}", "warn")
+                detection_err = e
+        
+        if not objs or len(objs) == 0:
+            log("❌", "EMBED", f"No face detected by any backend. Last error: {detection_err}", "error")
+            # Clean up temp file
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+            return {
+                "error": "No face detected. Please upload a clear, well-lit photo with a single visible face.",
+                "face_detected": False,
+                "face_confidence": 0
+            }
             
         # Clean up immediately
         if os.path.exists(temp_path):
@@ -1112,18 +1196,31 @@ def get_embedding(file: UploadFile = File(...)):
             except: pass
             
         if objs and len(objs) > 0:
-            log("✅", "EMBED", "Embedding generated successfully", "success")
-            return {"embedding": objs[0]["embedding"]}
+            face_conf = objs[0].get("face_confidence", 1.0)
+            # Check face quality — reject low-confidence detections
+            if face_conf < MIN_FACE_CONFIDENCE:
+                log("⚠️", "EMBED", f"Face detected but confidence too low ({face_conf:.2f})", "warn")
+                return {
+                    "error": f"Face detected but quality is too low (confidence: {face_conf:.0%}). Please use a clearer photo.",
+                    "face_detected": False,
+                    "face_confidence": face_conf
+                }
+            log("✅", "EMBED", f"Embedding generated successfully (face_confidence: {face_conf:.2f})", "success")
+            return {"embedding": objs[0]["embedding"], "face_detected": True, "face_confidence": face_conf}
         
         log("❌", "EMBED", "No face detected in the image", "error")
-        return {"error": "Could not find a valid face signature. Ensure the photo is clear and contains a face."}
+        return {
+            "error": "Could not find a valid face signature. Ensure the photo is clear and contains a face.",
+            "face_detected": False,
+            "face_confidence": 0
+        }
         
     except Exception as e:
         log("❌", "EMBED", f"Critical embedding error: {str(e)}", "error")
         if os.path.exists(temp_path):
             try: os.remove(temp_path)
             except: pass
-        return {"error": f"AI Engine Error: {str(e)}"}
+        return {"error": f"AI Engine Error: {str(e)}", "face_detected": False, "face_confidence": 0}
 
 # ── Entry Point ────────────────────────────────────────────
 if __name__ == "__main__":

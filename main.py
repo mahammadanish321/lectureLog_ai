@@ -700,19 +700,19 @@ class CameraWorker:
 
                 for area in unique_areas:
                     # Crop & optionally upscale the face from the ORIGINAL high-res frame
-                    face_crop = _upscale_face(raw, area, target_size=160)
+                    face_crop = _upscale_face(raw, area, target_size=224)
                     if face_crop is None:
                         continue
 
                     if area['w'] < self.min_face_px or area['h'] < self.min_face_px:
-                        log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 160x160 with Lanczos4", "dim")
+                        log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 224x224 with Lanczos4", "dim")
 
                     try:
                         # detector_backend="skip" tells DeepFace to trust our crop
                         # and skip re-detection, going straight to embedding extraction
                         embed_objs = DeepFace.represent(
                             img_path=face_crop,
-                            model_name="Facenet512",
+                            model_name="VGG-Face",
                             enforce_detection=False,
                             detector_backend="skip"
                         )
@@ -726,10 +726,10 @@ class CameraWorker:
                     embedding = embed_objs[0]["embedding"]
 
                     # ── Quality gate: validate embedding L2 norm ──
-                    # Valid Facenet512 embeddings have norms in a predictable range (~15-40).
+                    # Valid VGG-Face embeddings have norms in a predictable range (~10-150).
                     # Non-face crops produce embeddings with abnormal norms.
                     emb_norm = float(np.linalg.norm(embedding))
-                    if emb_norm < 10.0 or emb_norm > 40.0:
+                    if emb_norm < 5.0 or emb_norm > 200.0:
                         log("⚠️", f"CAM-{self.index}", f"Skipping low-quality embedding (norm={emb_norm:.1f})", "warn")
                         continue
 
@@ -925,7 +925,7 @@ async def lifespan(app: FastAPI):
             DeepFace = DF
             # Pre-load VGG-Face by doing a dummy representation
             dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-            DeepFace.represent(dummy, model_name="Facenet512", enforce_detection=False)
+            DeepFace.represent(dummy, model_name="VGG-Face", enforce_detection=False)
             log("✨", "AI", "Background warmup complete. Scanning will be fast.", "success")
         except Exception as e:
             log("⚠️", "AI", f"Warmup failed: {e}", "warn")
@@ -1170,7 +1170,7 @@ def get_embedding(file: UploadFile = File(...)):
                 log("🔍", "EMBED", f"Attempting DeepFace represent using {backend}...")
                 objs = DeepFace.represent(
                     img_path=temp_path,
-                    model_name="Facenet512",
+                    model_name="VGG-Face",
                     enforce_detection=True,
                     detector_backend=backend
                 )

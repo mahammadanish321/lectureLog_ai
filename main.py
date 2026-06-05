@@ -451,8 +451,8 @@ class CameraWorker:
             log("📷", "CAPTURE", f"Connecting to Video Source: {source}")
 
         # Open the capture object with specific backend for stability
-        # For URLs (HTTP), CAP_FFMPEG is the most stable on Windows
-        if str(source).startswith("http"):
+        # For URLs (HTTP/RTSP), CAP_FFMPEG is the most stable on Windows
+        if str(source).startswith(("http://", "https://", "rtsp://")):
             self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         else:
             self.cap = cv2.VideoCapture(source)
@@ -490,7 +490,10 @@ class CameraWorker:
                     log("❌", "CAMERA", f"Stream lost for Cam {self.index}. Reconnecting...", "error")
                     self.cap.release()
                     time.sleep(2)
-                    self.cap = cv2.VideoCapture(self.index)
+                    if str(self.index).startswith(("http://", "https://", "rtsp://")):
+                        self.cap = cv2.VideoCapture(self.index, cv2.CAP_FFMPEG)
+                    else:
+                        self.cap = cv2.VideoCapture(self.index)
                     fail_count = 0
                 time.sleep(0.1)
                 continue

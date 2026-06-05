@@ -50,10 +50,12 @@ def find_camera_index_by_label(target_label):
 def get_camera(idx):
     with _cameras_lock:
         if idx not in cameras:
-            print(f"[Camera-Backend] 📸 Attempting to open hardware camera {idx}...")
-            cap = cv2.VideoCapture(idx)
+            if str(idx).startswith(("http://", "https://", "rtsp://")):
+                cap = cv2.VideoCapture(idx, cv2.CAP_FFMPEG)
+            else:
+                cap = cv2.VideoCapture(idx)
             if not cap.isOpened():
-                print(f"[Camera-Backend] ❌ FAILED to open hardware camera {idx}")
+                print(f"[Camera-Backend] ❌ FAILED to open camera/stream {idx}")
                 return None
             
             print(f"[Camera-Backend] ✅ Camera {idx} hardware opened successfully")

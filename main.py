@@ -74,14 +74,14 @@ def _tile_frame(frame, grid_n, overlap):
     """
     if grid_n <= 1:
         return [(frame, 0, 0)]
-    
+
     h, w = frame.shape[:2]
     tiles = []
     step_x = w // grid_n
     step_y = h // grid_n
     pad_x = int(step_x * overlap)
     pad_y = int(step_y * overlap)
-    
+
     for row in range(grid_n):
         for col in range(grid_n):
             x1 = max(0, col * step_x - pad_x)
@@ -90,7 +90,7 @@ def _tile_frame(frame, grid_n, overlap):
             y2 = min(h, (row + 1) * step_y + pad_y)
             tile = frame[y1:y2, x1:x2]
             tiles.append((tile, x1, y1))
-    
+
     return tiles
 
 def _upscale_face(frame, area, target_size=160):
@@ -119,7 +119,7 @@ def _nms_areas(areas, iou_threshold=0.4):
     """
     if len(areas) <= 1:
         return areas
-    
+
     def iou(a, b):
         ax1, ay1 = a['x'], a['y']
         ax2, ay2 = ax1 + a['w'], ay1 + a['h']
@@ -132,7 +132,7 @@ def _nms_areas(areas, iou_threshold=0.4):
             return 0.0
         union = a['w']*a['h'] + b['w']*b['h'] - inter
         return inter / union if union > 0 else 0.0
-    
+
     kept = []
     used = [False] * len(areas)
     for i in range(len(areas)):
@@ -169,11 +169,11 @@ def find_camera_index_by_label(target_label):
 def get_camera_url(cam_info, label=None):
     """Convert a camera_url string or index to a full stream URL or hardware index."""
     cam_info = str(cam_info).strip()
-    
+
     # If it's already a full URL, use it
     if cam_info.startswith("http://") or cam_info.startswith("https://") or cam_info.startswith("rtsp://"):
         return cam_info
-        
+
     # If a label is provided, try to find the hardware index by label first for accuracy
     if label and len(str(label)) > 3:
         matched_idx = find_camera_index_by_label(label)
@@ -183,7 +183,7 @@ def get_camera_url(cam_info, label=None):
     # Fallback to the digit index from DB
     if cam_info.isdigit():
         return int(cam_info)
-        
+
     # Default to camera 0
     return 0
 
@@ -263,7 +263,7 @@ def refresh_student_cache():
                         s['face_embeddings'] = json.loads(s['face_embeddings'])
                     except:
                         s['face_embeddings'] = None
-            
+
             # Build a flat numpy matrix for fast vectorized cosine matching:
             # Each row is one embedding angle. Shape: (n_angles, 512)
             angles = []
@@ -274,7 +274,7 @@ def refresh_student_cache():
             # Fallback: use the legacy single embedding
             if not angles and has_primary and isinstance(s['face_embedding'], list):
                 angles.append(s['face_embedding'])
-            
+
             if angles:
                 s['_embeddings_matrix'] = np.array(angles, dtype=np.float32)  # (n, 512)
                 all_valid.append(s)
@@ -334,7 +334,7 @@ def _cleanup_idle_cameras(exclude=None, force=False):
             if not force and (now - worker._last_stream_time) < 15:
                 log("👁️", "CLEANUP", f"Camera {idx} kept alive (active viewer)", "dim")
                 continue
-            
+
             # Derivative: If it's a backend URL, tell the backend to release it too
             try:
                 if str(idx).startswith(STREAM_BACKEND_URL):
@@ -432,7 +432,7 @@ class CameraWorker:
         # Determine the correct source: If it's a hardware index, route through Camera Backend to avoid locks
         source = self.index
         is_hardware = False
-        
+
         if isinstance(self.index, (int, float)) or (isinstance(self.index, str) and self.index.isdigit()):
             is_hardware = True
             # Pre-check: Is the camera backend even alive?
@@ -446,7 +446,7 @@ class CameraWorker:
                     is_hardware = False # Fallback to direct if health check fails but returns a code
             except:
                 is_hardware = False # Fallback to direct if backend is totally offline
-        
+
         if not is_hardware:
             log("📷", "CAPTURE", f"Connecting to Video Source: {source}")
 
@@ -457,39 +457,17 @@ class CameraWorker:
         else:
             self.cap = cv2.VideoCapture(source)
 
-        if not self.cap.isOpened():
-            # Desperate fallback for hardware
-            if is_hardware:
-                log("⚠️", "CAMERA", "Backend stream failed, attempting direct hardware access...")
-                self.cap = cv2.VideoCapture(int(self.index))
-            
-            if not self.cap.isOpened():
-                log("❌", "CAMERA", f"Video source {source} could not be opened!", "error")
-                self.status = "Hardware Error"
-                self.error_message = f"Source {source} Failed"
-                self.running = False
-                return
-
-        log("✅", "CAPTURE", f"Video source {source} Opened Successfully")
-        self.status = "Camera Online"
-
-        # Set lower resolution to reduce memory
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 15)
-
         fail_count = 0
-
         while self.running:
             ret, frame = self.cap.read()
+            
             if not ret:
                 fail_count += 1
-                if fail_count % 10 == 0:
-                    log("⚠️", "CAPTURE", f"Stream glitch on Cam {self.index}, retrying... ({fail_count}/50)", "warn")
-                if fail_count > 50:
+                if fail_count > 5:
                     log("❌", "CAMERA", f"Stream lost for Cam {self.index}. Reconnecting...", "error")
                     self.cap.release()
                     time.sleep(2)
+                    self.cap = cv2.VideoCapture(self.index)
                     if str(self.index).startswith(("http://", "https://", "rtsp://")):
                         self.cap = cv2.VideoCapture(self.index, cv2.CAP_FFMPEG)
                     else:
@@ -513,16 +491,16 @@ class CameraWorker:
                 small_gray = cv2.resize(gray, (320, 240))
                 scale_x = frame.shape[1] / 320.0
                 scale_y = frame.shape[0] / 240.0
-                
+
                 live_faces = self.face_cascade.detectMultiScale(small_gray, 1.1, 4)
-                
+
                 current_tracked = []
                 for (lx, ly, lw, lh) in live_faces:
                     lx, ly, lw, lh = int(lx*scale_x), int(ly*scale_y), int(lw*scale_x), int(lh*scale_y)
                     lcx, lcy = lx + lw/2, ly + lh/2
                     best_match = None
                     min_dist = 150
-                    
+
                     for t in self.tracked_faces:
                         tx, ty, tw, th = t.get('bbox', [0,0,0,0])
                         tcx, tcy = tx + tw/2, ty + th/2
@@ -530,16 +508,16 @@ class CameraWorker:
                         if dist < min_dist:
                             min_dist = dist
                             best_match = t
-                            
+
                     if best_match:
                         best_match['bbox'] = [lx, ly, lw, lh]
                         best_match['last_seen'] = time.time()
                         current_tracked.append(best_match)
-                        
+
                 for t in self.tracked_faces:
                     if t not in current_tracked and (time.time() - t.get('last_seen', 0)) < 1.0:
                         current_tracked.append(t)
-                        
+
                 self.tracked_faces = current_tracked
 
                 for t in self.tracked_faces:
@@ -590,13 +568,13 @@ class CameraWorker:
             status_text = self.status
             if self.is_scanning:
                 status_text = "AI SCANNING ACTIVE"
-            
+
             status_color = (0, 200, 0) if self.is_scanning else (128, 128, 128)
             if "Error" in self.status or "Failed" in self.status:
                 status_color = (0, 0, 200)
 
             cv2.putText(display, f"CAM {self.index}: {status_text}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-            
+
             if self.error_message:
                 cv2.putText(display, f"Error: {self.error_message}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
@@ -700,19 +678,19 @@ class CameraWorker:
 
                 for area in unique_areas:
                     # Crop & optionally upscale the face from the ORIGINAL high-res frame
-                    face_crop = _upscale_face(raw, area, target_size=224)
+                    face_crop = _upscale_face(raw, area, target_size=160)
                     if face_crop is None:
                         continue
 
                     if area['w'] < self.min_face_px or area['h'] < self.min_face_px:
-                        log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 224x224 with Lanczos4", "dim")
+                        log("🔬", f"CAM-{self.index}", f"Small face ({area['w']}x{area['h']}px) — upscaled to 160x160 with Lanczos4", "dim")
 
                     try:
                         # detector_backend="skip" tells DeepFace to trust our crop
                         # and skip re-detection, going straight to embedding extraction
                         embed_objs = DeepFace.represent(
                             img_path=face_crop,
-                            model_name="VGG-Face",
+                            model_name="Facenet512",
                             enforce_detection=False,
                             detector_backend="skip"
                         )
@@ -726,10 +704,10 @@ class CameraWorker:
                     embedding = embed_objs[0]["embedding"]
 
                     # ── Quality gate: validate embedding L2 norm ──
-                    # Valid VGG-Face embeddings have norms in a predictable range (~10-150).
+                    # Valid Facenet512 embeddings have norms in a predictable range (~15-40).
                     # Non-face crops produce embeddings with abnormal norms.
                     emb_norm = float(np.linalg.norm(embedding))
-                    if emb_norm < 5.0 or emb_norm > 200.0:
+                    if emb_norm < 10.0 or emb_norm > 40.0:
                         log("⚠️", f"CAM-{self.index}", f"Skipping low-quality embedding (norm={emb_norm:.1f})", "warn")
                         continue
 
@@ -915,7 +893,7 @@ async def lifespan(app: FastAPI):
     global DeepFace
     log("🚀", "SYSTEM", "Merge AI Service starting...")
     log("📋", "SYSTEM", f"Config: threshold={CONFIDENCE_THRESHOLD}, cooldown={COOLDOWN_PERIOD}s, scale={FRAME_SCALE}, interval={RECOGNITION_INTERVAL}s")
-    
+
     # Start a background thread to warm up DeepFace so it doesn't lag the first scan
     def warmup():
         global DeepFace
@@ -925,7 +903,7 @@ async def lifespan(app: FastAPI):
             DeepFace = DF
             # Pre-load VGG-Face by doing a dummy representation
             dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-            DeepFace.represent(dummy, model_name="VGG-Face", enforce_detection=False)
+            DeepFace.represent(dummy, model_name="Facenet512", enforce_detection=False)
             log("✨", "AI", "Background warmup complete. Scanning will be fast.", "success")
         except Exception as e:
             log("⚠️", "AI", f"Warmup failed: {e}", "warn")
@@ -977,7 +955,7 @@ async def get_hardware_cameras():
             unique_names = []
             for name in lines:
                 if name not in unique_names: unique_names.append(name)
-            
+
             cameras = []
             for idx, name in enumerate(unique_names):
                 cameras.append({"id": str(idx), "name": name})
@@ -1002,7 +980,7 @@ async def refresh_system(scan: bool = True):
     - scan=True: Automatically start scanning on all active cameras.
     """
     refresh_student_cache()
-    
+
     if system_active and current_session_info:
         needed = set()
         for sess in current_session_info:
@@ -1013,7 +991,7 @@ async def refresh_system(scan: bool = True):
             if scan:
                 worker.is_scanning = True
                 log("🔍", "SYSTEM", f"Scanning started for Stream {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
-        
+
         # Stop any cameras that were running but are no longer in the active sessions
         _cleanup_idle_cameras(exclude=needed)
     else:
@@ -1075,10 +1053,10 @@ async def video_feed(v: str = "default", cam: str = None):
         target_sess = None
         if current_session_info:
             target_sess = next((s for s in current_session_info if str(s.get('id')) == v), None)
-        
+
         if target_sess:
             target_url = get_camera_url(target_sess.get('camera_url', '0'), target_sess.get('camera_name'))
-        
+
         # If still no URL or fallback needed
         if target_url is None:
             log("📡", "STREAM", f"Session {v} lookup failed. Searching for ANY active camera...", "warn")
@@ -1091,7 +1069,7 @@ async def video_feed(v: str = "default", cam: str = None):
                 s = current_session_info[0]
                 target_url = get_camera_url(s.get('camera_url', '0'), s.get('camera_name'))
                 log("✅", "STREAM", f"Fallback found pending session: {target_url}")
-    
+
     if target_url is None:
          # No target (Idle state) — send an idle placeholder instead of opening hardware
          async def idle_gen():
@@ -1137,10 +1115,10 @@ def get_embedding(file: UploadFile = File(...)):
     # Always save as standard JPEG so OpenCV / DeepFace can read it flawlessly without codec errors
     temp_path = os.path.join(os.getcwd(), f"temp_{int(time.time())}_{base_name}.jpg")
     log("📁", "EMBED", f"Processing embedding request for: {file.filename}")
-    
+
     try:
         content = file.file.read()
-        
+
         try:
             from PIL import Image
             import io
@@ -1148,7 +1126,7 @@ def get_embedding(file: UploadFile = File(...)):
                 import pillow_avif
             except ImportError:
                 pass
-            
+
             img = Image.open(io.BytesIO(content))
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -1158,9 +1136,9 @@ def get_embedding(file: UploadFile = File(...)):
             log("⚠️", "EMBED", f"PIL conversion note: {pil_err}. Saving raw bytes...", "warn")
             with open(temp_path, "wb") as f:
                 f.write(content)
-        
+
         log("🔍", "EMBED", f"File ready at {temp_path}, starting DeepFace analysis...")
-        
+
         # Try face detection with a list of backends (mtcnn first, then retinaface, then opencv)
         detector_backends = ["mtcnn", "retinaface", "opencv"]
         objs = None
@@ -1170,7 +1148,7 @@ def get_embedding(file: UploadFile = File(...)):
                 log("🔍", "EMBED", f"Attempting DeepFace represent using {backend}...")
                 objs = DeepFace.represent(
                     img_path=temp_path,
-                    model_name="VGG-Face",
+                    model_name="Facenet512",
                     enforce_detection=True,
                     detector_backend=backend
                 )
@@ -1180,7 +1158,7 @@ def get_embedding(file: UploadFile = File(...)):
             except Exception as e:
                 log("⚠️", "EMBED", f"Face detection failed using {backend}: {e}", "warn")
                 detection_err = e
-        
+
         if not objs or len(objs) == 0:
             log("❌", "EMBED", f"No face detected by any backend. Last error: {detection_err}", "error")
             # Clean up temp file
@@ -1192,12 +1170,12 @@ def get_embedding(file: UploadFile = File(...)):
                 "face_detected": False,
                 "face_confidence": 0
             }
-            
+
         # Clean up immediately
         if os.path.exists(temp_path):
             try: os.remove(temp_path)
             except: pass
-            
+
         if objs and len(objs) > 0:
             face_conf = objs[0].get("face_confidence", 1.0)
             # Check face quality — reject low-confidence detections
@@ -1210,14 +1188,14 @@ def get_embedding(file: UploadFile = File(...)):
                 }
             log("✅", "EMBED", f"Embedding generated successfully (face_confidence: {face_conf:.2f})", "success")
             return {"embedding": objs[0]["embedding"], "face_detected": True, "face_confidence": face_conf}
-        
+
         log("❌", "EMBED", "No face detected in the image", "error")
         return {
             "error": "Could not find a valid face signature. Ensure the photo is clear and contains a face.",
             "face_detected": False,
             "face_confidence": 0
         }
-        
+
     except Exception as e:
         log("❌", "EMBED", f"Critical embedding error: {str(e)}", "error")
         if os.path.exists(temp_path):

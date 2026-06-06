@@ -21,22 +21,22 @@ def find_camera_index_by_label(target_label):
     """
     if not target_label:
         return None
-        
+
     print(f"[Camera-Backend] 🔍 Searching hardware for: {target_label}")
-    
+
     try:
         # Get list of devices in the order the OS assigns them
         cmd = ["powershell", "-Command", "Get-PnpDevice -Class Image,Camera,Video -Status OK | Select-Object FriendlyName"]
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode == 0:
             lines = [line.strip() for line in result.stdout.split('\n') if line.strip() and '---' not in line and 'FriendlyName' not in line]
-            
+
             # Map unique names to their OS index
             unique_devices = []
             for name in lines:
                 if name not in unique_devices: unique_devices.append(name)
-            
+
             for idx, name in enumerate(unique_devices):
                 # Check for exact or close match
                 if target_label.lower() in name.lower() or name.lower() in target_label.lower():
@@ -44,25 +44,28 @@ def find_camera_index_by_label(target_label):
                     return idx
     except Exception as e:
         print(f"[Camera-Backend] ⚠️ Label lookup failed: {e}")
-    
+
     return None
 
 def get_camera(idx):
     with _cameras_lock:
         if idx not in cameras:
+            print(f"[Camera-Backend] 📸 Attempting to open hardware camera {idx}...")
+            cap = cv2.VideoCapture(idx)
             if str(idx).startswith(("http://", "https://", "rtsp://")):
                 cap = cv2.VideoCapture(idx, cv2.CAP_FFMPEG)
             else:
                 cap = cv2.VideoCapture(idx)
             if not cap.isOpened():
+                print(f"[Camera-Backend] ❌ FAILED to open hardware camera {idx}")
                 print(f"[Camera-Backend] ❌ FAILED to open camera/stream {idx}")
                 return None
-            
+
             print(f"[Camera-Backend] ✅ Camera {idx} hardware opened successfully")
             # Set lower resolution for performance
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
+
             cameras[idx] = {
                 "cap": cap,
                 "lock": threading.Lock(),
@@ -70,11 +73,11 @@ def get_camera(idx):
                 "running": True,
                 "last_access": time.time()
             }
-            
+
             # Start background capture thread
             thread = threading.Thread(target=capture_loop, args=(idx,), daemon=True)
             thread.start()
-            
+
         return cameras[idx]
 
 def capture_loop(idx):
@@ -95,19 +98,19 @@ def generate_frames(idx):
         if not cam or not cam["running"]:
             time.sleep(1)
             continue
-            
+
         with cam["lock"]:
             cam["last_access"] = time.time() # Mark as active
             frame = cam["last_frame"]
-            
+
         if frame is not None:
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        
+
         time.sleep(0.03)
-        
+
         # Recovery logic
         if cam and not cam["running"]:
             print(f"[Camera-Backend] 🔄 Attempting to recover Camera {idx}...")
@@ -123,7 +126,7 @@ async def video_feed(idx: str, label: str = Query(None)):
     2. If no label or label not found, we use 'idx' as fallback (could be RTSP URL or Index).
     """
     actual_idx = idx
-    
+
     # Priority 1: Use label to find hardware index (handles Windows index shifting)
     if label and label.strip():
         matched_idx = find_camera_index_by_label(label)
@@ -134,7 +137,7 @@ async def video_feed(idx: str, label: str = Query(None)):
     # Priority 2: Use provided idx directly
     elif idx.isdigit():
         actual_idx = int(idx)
-            
+
     print(f"[Camera-Backend] 📡 Stream request: Source={actual_idx} (Requested ID={idx}, Label={label})")
     return StreamingResponse(generate_frames(actual_idx), media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -153,7 +156,7 @@ async def list_cameras():
             unique_names = []
             for name in lines:
                 if name not in unique_names: unique_names.append(name)
-            
+
             # Return as objects for easier mapping
             return {"cameras": [{"index": i, "name": name} for i, name in enumerate(unique_names)]}
     except Exception as e:
@@ -184,7 +187,7 @@ def cleanup_idle_cameras():
         time.sleep(2)
         now = time.time()
         to_delete = []
-        
+
         with _cameras_lock:
             for idx, cam in cameras.items():
                 if now - cam["last_access"] > 5:
@@ -194,7 +197,7 @@ def cleanup_idle_cameras():
                         if cam["cap"]:
                             cam["cap"].release()
                     to_delete.append(idx)
-            
+
             for idx in to_delete:
                 del cameras[idx]
 

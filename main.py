@@ -198,8 +198,14 @@ def refresh_student_cache():
         active_sessions = []
         try:
             params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
+            from urllib.parse import urlparse
+            parsed_url = urlparse(SESSIONS_API)
+            api_path = parsed_url.path
+            query_str = f"?organization_id={ORGANIZATION_ID}" if ORGANIZATION_ID else ""
+            log("📡", "SYNC", f"API Query: GET {api_path}{query_str} (Org ID: {ORGANIZATION_ID or 'Global'})", "info")
+            
             sess_resp = requests.get(SESSIONS_API, params=params, timeout=5)
-            log("📡", "SYNC", f"Fetch {SESSIONS_API} - Status: {sess_resp.status_code}", "info")
+            log("📡", "SYNC", f"API Response: Status {sess_resp.status_code}", "info")
             if sess_resp.status_code == 200:
                 sessions = sess_resp.json()
                 log("📡", "SYNC", f"Raw sessions count: {len(sessions)}", "info")
@@ -229,7 +235,14 @@ def refresh_student_cache():
         # ── Step 3: Fetch students ──
         try:
             params = {"organization_id": ORGANIZATION_ID, "verified_only": "true"} if ORGANIZATION_ID else {"verified_only": "true"}
+            from urllib.parse import urlparse
+            parsed_url = urlparse(STUDENTS_API)
+            api_path = parsed_url.path
+            query_str = f"?organization_id={ORGANIZATION_ID}&verified_only=true" if ORGANIZATION_ID else "?verified_only=true"
+            log("📡", "SYNC", f"API Query: GET {api_path}{query_str} (Org ID: {ORGANIZATION_ID or 'Global'})", "info")
+            
             response = requests.get(STUDENTS_API, params=params, timeout=5)
+            log("📡", "SYNC", f"API Response: Status {response.status_code}", "info")
             if response.status_code != 200:
                 log("❌", "SYNC", f"Students API returned {response.status_code}", "error")
                 return
@@ -1018,7 +1031,16 @@ async def stop_scanner(cam: int = 0):
 async def list_cameras():
     """Return all registered classroom cameras from the backend."""
     try:
-        resp = requests.get(CLASSROOMS_API, timeout=3)
+        from urllib.parse import urlparse
+        parsed_url = urlparse(CLASSROOMS_API)
+        api_path = parsed_url.path
+        query_str = f"?organization_id={ORGANIZATION_ID}" if ORGANIZATION_ID else ""
+        log("📡", "SYNC", f"API Query: GET {api_path}{query_str} (Org ID: {ORGANIZATION_ID or 'Global'})", "info")
+        
+        params = {"organization_id": ORGANIZATION_ID} if ORGANIZATION_ID else {}
+        resp = requests.get(CLASSROOMS_API, params=params, timeout=3)
+        log("📡", "SYNC", f"API Response: Status {resp.status_code}", "info")
+        
         if resp.status_code == 200:
             classrooms = resp.json()
             cameras = []

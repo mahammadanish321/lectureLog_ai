@@ -318,14 +318,43 @@ def refresh_student_cache():
         # ── Step 6: Start workers for active sessions and bind session context ──
         if active_sessions:
             for sess in active_sessions:
-                url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
-                camera_type = sess.get('camera_type', 'webcam')
-                camera_quality = sess.get('camera_quality', '720p')
-                worker = _ensure_camera(url, camera_type, camera_quality)
-                worker.set_session(sess)  # Bind session context (id, year, stream) to this camera worker
-                if not worker.is_scanning:
-                    worker.is_scanning = True
-                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
+                # Multi-camera support: iterate through classrooms and their cameras
+                classrooms = sess.get('classrooms', [])
+                if classrooms:
+                    for cr in classrooms:
+                        cameras = cr.get('cameras', [])
+                        if cameras:
+                            for cam in cameras:
+                                cam_url_raw = cam.get('camera_url', '0')
+                                url = get_camera_url(cam_url_raw, cam.get('camera_name'))
+                                camera_type = cam.get('camera_type', 'webcam')
+                                camera_quality = cam.get('camera_quality', '720p')
+                                worker = _ensure_camera(url, camera_type, camera_quality)
+                                worker.set_session(sess)
+                                if not worker.is_scanning:
+                                    worker.is_scanning = True
+                                    log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url} (Room: {cr.get('name', '?')}) → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
+                        else:
+                            # Fallback: classroom has no cameras table entries, use classroom's camera_url
+                            cam_url_raw = cr.get('camera_url', '0')
+                            url = get_camera_url(cam_url_raw, cr.get('camera_name'))
+                            camera_type = cr.get('camera_type', 'webcam')
+                            camera_quality = cr.get('camera_quality', '720p')
+                            worker = _ensure_camera(url, camera_type, camera_quality)
+                            worker.set_session(sess)
+                            if not worker.is_scanning:
+                                worker.is_scanning = True
+                                log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url} (Room: {cr.get('name', '?')}) → Session {sess.get('id')}", "success")
+                else:
+                    # Legacy fallback: no classrooms array, use session-level camera_url
+                    url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
+                    camera_type = sess.get('camera_type', 'webcam')
+                    camera_quality = sess.get('camera_quality', '720p')
+                    worker = _ensure_camera(url, camera_type, camera_quality)
+                    worker.set_session(sess)
+                    if not worker.is_scanning:
+                        worker.is_scanning = True
+                        log("🔍", "SYSTEM", f"Auto-started scanning for Camera {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
 
         log("👤", "SYNC", f"Cache updated: {len(student_cache)} students ready for recognition", "success")
 
@@ -997,13 +1026,37 @@ async def refresh_system(scan: bool = True):
     if system_active and current_session_info:
         needed = set()
         for sess in current_session_info:
-            url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
-            needed.add(url)
-            worker = _ensure_camera(url)
-            worker.set_session(sess)  # Bind session context so attendance posts to the right session
-            if scan:
-                worker.is_scanning = True
-                log("🔍", "SYSTEM", f"Scanning started for Stream {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
+            # Multi-camera support: iterate through classrooms and their cameras
+            classrooms = sess.get('classrooms', [])
+            if classrooms:
+                for cr in classrooms:
+                    cameras = cr.get('cameras', [])
+                    if cameras:
+                        for cam in cameras:
+                            url = get_camera_url(cam.get('camera_url', '0'), cam.get('camera_name'))
+                            needed.add(url)
+                            worker = _ensure_camera(url, cam.get('camera_type', 'webcam'), cam.get('camera_quality', '720p'))
+                            worker.set_session(sess)
+                            if scan:
+                                worker.is_scanning = True
+                                log("🔍", "SYSTEM", f"Scanning started for Stream {url} (Room: {cr.get('name', '?')}) → Session {sess.get('id')}", "success")
+                    else:
+                        url = get_camera_url(cr.get('camera_url', '0'), cr.get('camera_name'))
+                        needed.add(url)
+                        worker = _ensure_camera(url, cr.get('camera_type', 'webcam'), cr.get('camera_quality', '720p'))
+                        worker.set_session(sess)
+                        if scan:
+                            worker.is_scanning = True
+                            log("🔍", "SYSTEM", f"Scanning started for Stream {url} (Room: {cr.get('name', '?')}) → Session {sess.get('id')}", "success")
+            else:
+                # Legacy fallback: no classrooms array
+                url = get_camera_url(sess.get('camera_url', '0'), sess.get('camera_name'))
+                needed.add(url)
+                worker = _ensure_camera(url)
+                worker.set_session(sess)
+                if scan:
+                    worker.is_scanning = True
+                    log("🔍", "SYSTEM", f"Scanning started for Stream {url} → Session {sess.get('id')} (Year {sess.get('year')} {sess.get('stream')})", "success")
 
         # Stop any cameras that were running but are no longer in the active sessions
         _cleanup_idle_cameras(exclude=needed)
@@ -1058,16 +1111,20 @@ async def list_cameras():
         return []
 
 @app.get("/video_feed")
-async def video_feed(v: str = "default", cam: str = None):
+async def video_feed(v: str = "default", cam: str = None, camera_url: str = None):
     """
     Stream video from a camera.
-    - ?v=<session_id>  → Show camera linked to that session
-    - ?cam=<index>     → Show a specific camera by index (idle browsing mode)
-    - default          → Show first available camera
+    - ?v=<session_id>       → Show camera linked to that session (legacy: first camera)
+    - ?camera_url=<url>     → Show a specific camera by its URL (multi-camera mode)
+    - ?cam=<index>          → Show a specific camera by index (idle browsing mode)
+    - default               → Show first available camera
     """
     target_url = None
 
-    if cam is not None:
+    if camera_url is not None:
+        # Multi-camera mode: direct camera URL selection
+        target_url = get_camera_url(camera_url)
+    elif cam is not None:
         # Direct camera index mode (idle browsing)
         target_url = get_camera_url(cam)
     elif v and v != "default":
